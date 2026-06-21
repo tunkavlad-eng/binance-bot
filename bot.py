@@ -29,8 +29,8 @@ USER_KEYS: dict[int, dict] = {}
 
 # ─── Режим торговли (demo / real) ─────────────────────────────────────────────
 REAL_FUTURES_API = "https://fapi.binance.com/fapi/v1"
-DEMO_FUTURES_API = "https://testnet.binancefuture.com/fapi/v1"
-DEMO_FUTURES_API_V2 = "https://testnet.binancefuture.com/fapi/v2"
+DEMO_FUTURES_API = "https://demo-fapi.binance.com/fapi/v1"
+DEMO_FUTURES_API_V2 = "https://demo-fapi.binance.com/fapi/v2"
 USER_MODE: dict[int, str] = {}   # chat_id -> "real" | "demo"  (default: "real")
 
 def get_futures_api(chat_id: int) -> str:
@@ -1054,8 +1054,8 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mode = USER_MODE.get(user_id, "real")
 
     if mode == "demo":
-        # Testnet-ключи валидны только на testnet.binancefuture.com,
-        # проверяем через futures-баланс (V2), а не через спотовый /account.
+        # Demo Trading ключи (demo.binance.com, вход через основной аккаунт Binance)
+        # валидны на demo-fapi.binance.com, проверяем через futures-баланс (V2).
         params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
         # ВАЖНО: строка для подписи должна быть в ТОМ ЖЕ порядке, в котором параметры
         # реально уйдут в запросе (params.items(), без sorted) — иначе подпись не совпадёт
@@ -1077,7 +1077,7 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ok = test is not None and "code" not in (test or {})
 
     if not ok:
-        mode_hint = "демо (testnet.binancefuture.com)" if mode == "demo" else "реального Binance"
+        mode_hint = "демо (demo.binance.com — Demo Trading в твоём основном аккаунте)" if mode == "demo" else "реального Binance"
         await update.message.reply_text(
             f"❌ Неверные ключи или недостаточно прав.\n\n"
             f"Режим сейчас: *{'🧪 DEMO' if mode == 'demo' else '💰 REAL'}*\n"
@@ -1872,13 +1872,13 @@ async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     current = USER_MODE.get(chat_id, "real")
 
     if not ctx.args:
-        label = "🧪 DEMO (testnet.binancefuture.com)" if current == "demo" else "💰 REAL (реальный Binance)"
+        label = "🧪 DEMO (demo.binance.com)" if current == "demo" else "💰 REAL (реальный Binance)"
         await update.message.reply_text(
             f"🌐 *Текущий режим:* {label}\n\n"
-            f"• `/mode demo` — переключить на демо (testnet, виртуальные деньги)\n"
+            f"• `/mode demo` — переключить на демо (Demo Trading, виртуальные деньги)\n"
             f"• `/mode real` — переключить на реальный Binance\n\n"
             f"⚠️ При смене режима нужно ввести `/setkey` с ключами для нового режима.\n"
-            f"Для демо ключи берутся на *testnet.binancefuture.com* (вход через GitHub).",
+            f"Для демо ключи берутся на *demo.binance.com* (вход через твой обычный аккаунт Binance).",
             parse_mode="Markdown"
         )
         return
@@ -1896,13 +1896,13 @@ async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if mode == "demo":
         await update.message.reply_text(
             "🧪 *Режим DEMO включён*\n\n"
-            "Бот будет использовать *testnet.binancefuture.com*.\n\n"
-            "Как получить тестовые ключи:\n"
-            "1. Зайди на testnet.binancefuture.com\n"
-            "2. Войди через GitHub\n"
-            "3. Нажми *API Key* → *Generate HMAC\\_SHA256 Key*\n"
+            "Бот будет использовать *demo-fapi.binance.com* (Demo Trading).\n\n"
+            "Как получить демо-ключи:\n"
+            "1. Зайди на *demo.binance.com* (или включи Demo Trading в основном приложении/сайте Binance)\n"
+            "2. Войди обычным аккаунтом Binance (тот же логин, что и на binance.com)\n"
+            "3. Открой *API Management* → *Create API* → разреши *Enable Reading* и *Enable Futures*\n"
             "4. Введи в боте: `/setkey API\\_KEY SECRET`\n\n"
-            "На балансе будет ~10,000 виртуальных USDT.\n"
+            "Баланс — виртуальный, выдаётся/сбрасывается в интерфейсе Demo Trading.\n"
             "Старый ключ (если был) удалён — нужно подключить новый.",
             parse_mode="Markdown"
         )
