@@ -33,6 +33,14 @@ MARKET_SCAN_SUBSCRIBERS: set = set()
 LAST_SIGNAL_SENT: dict[tuple, str] = {}  # (chat_id, symbol) -> last signal string
 ALERT_SCORE_THRESHOLD = 5.0  # |score| >= 5 считается "сильным" сигналом для алерта
 
+# ─── Автоторговля ─────────────────────────────────────────────────────────────
+AUTOTRADE_ENABLED: dict[int, bool] = {}       # chat_id -> вкл/выкл
+AUTOTRADE_RISK_PCT: dict[int, float] = {}     # chat_id -> % баланса на сделку
+PENDING_TRADES: dict[str, dict] = {}          # trade_id -> данные сделки (до подтверждения)
+OPEN_AUTOTRADES: dict[int, list] = {}         # chat_id -> список открытых авто-позиций
+AUTOTRADE_SCORE_THRESHOLD = 6.0              # порог сигнала (чуть выше алертного)
+DEFAULT_LEVERAGE = 3                          # плечо по умолчанию
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def normalize_symbol(symbol: str) -> str:
@@ -1271,6 +1279,23 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             args = [symbol]
         await analyze(FU(), FC())
 
+    elif action == "trade_confirm":
+        trade_id = symbol  # здесь symbol содержит trade_id
+        trade_info = PENDING_TRADES.pop(trade_id, None)
+        if not trade_info:
+            await query.message.edit_text("⚠️ Сигнал устарел или уже обработан.")
+            return
+        await query.message.edit_text(
+            f"⏳ Открываю позицию *{trade_info['symbol'].replace('USDT','')}*...",
+            parse_mode="Markdown"
+        )
+        await execute_trade(query.from_user.id, trade_info, ctx)
+
+    elif action == "trade_cancel":
+        trade_id = symbol
+        PENDING_TRADES.pop(trade_id, None)
+        await query.message.edit_text("❌ Сделка отменена.")
+
     elif action == "help":
         section = symbol  # после ":" лежит ключ раздела (main/data/analysis/...)
         try:
@@ -1446,6 +1471,412 @@ async def global_error_handler(update, ctx: ContextTypes.DEFAULT_TYPE):
     logger.warning(f"Необработанная ошибка: {ctx.error}")
 
 
+# ─── Автоторговля: helpers ────────────────────────────────────────────────────
+
+def futures_signed_request(method, endpoint, api_key, api_secret, params=None):
+    """Подписанный запрос к Binance Futures API."""
+    params = params or {}
+    params["timestamp"] = int(time.time() * 1000)
+    params["recvWindow"] = 5000
+    query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+    params["signature"] = signature
+    headers = {"X-MBX-APIKEY": api_key}
+    url = f"https://fapi.binance.com/fapi/v1/{endpoint}"
+    try:
+        if method == "GET":
+            r = requests.get(url, params=params, headers=headers, timeout=10)
+        elif method == "POST":
+            r = requests.post(url, params=params, headers=headers, timeout=10)
+        elif method == "DELETE":
+            r = requests.delete(url, params=params, headers=headers, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.error(f"Futures signed request error ({endpoint}): {e}")
+        return None
+
+
+def get_futures_balance(api_key, api_secret):
+    """Возвращает доступный USDT баланс на фьючерсном аккаунте."""
+    data = futures_signed_request("GET", "account", api_key, api_secret)
+    if not data or "assets" not in data:
+        return None
+    for asset in data["assets"]:
+        if asset["asset"] == "USDT":
+            return float(asset["availableBalance"])
+    return None
+
+
+def get_symbol_info(symbol):
+    """Получает точность цены/количества и минимальный лот для символа."""
+    try:
+        r = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=10)
+        r.raise_for_status()
+        for s in r.json()["symbols"]:
+            if s["symbol"] == symbol:
+                price_precision = s["pricePrecision"]
+                qty_precision = s["quantityPrecision"]
+                min_qty = None
+                for f in s["filters"]:
+                    if f["filterType"] == "LOT_SIZE":
+                        min_qty = float(f["minQty"])
+                return price_precision, qty_precision, min_qty
+    except Exception as e:
+        logger.error(f"get_symbol_info {symbol}: {e}")
+    return 2, 3, 0.001
+
+
+def set_leverage(symbol, leverage, api_key, api_secret):
+    return futures_signed_request("POST", "leverage", api_key, api_secret,
+                                   {"symbol": symbol, "leverage": leverage})
+
+
+def place_futures_market_order(symbol, side, quantity, qty_precision, api_key, api_secret):
+    """Открывает рыночный ордер на фьючерсах."""
+    qty = round(quantity, qty_precision)
+    return futures_signed_request("POST", "order", api_key, api_secret, {
+        "symbol": symbol,
+        "side": side,
+        "type": "MARKET",
+        "quantity": qty,
+        "positionSide": "BOTH",
+    })
+
+
+def place_sl_tp_orders(symbol, direction, sl_price, tp_price, quantity,
+                        price_precision, qty_precision, api_key, api_secret):
+    """Ставит STOP_MARKET (SL) и TAKE_PROFIT_MARKET (TP) ордера."""
+    close_side = "SELL" if direction == "long" else "BUY"
+    qty = round(quantity, qty_precision)
+    sl_params = {
+        "symbol": symbol, "side": close_side, "type": "STOP_MARKET",
+        "quantity": qty, "stopPrice": round(sl_price, price_precision),
+        "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
+    }
+    tp_params = {
+        "symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
+        "quantity": qty, "stopPrice": round(tp_price, price_precision),
+        "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
+    }
+    sl_res = futures_signed_request("POST", "order", api_key, api_secret, sl_params)
+    tp_res = futures_signed_request("POST", "order", api_key, api_secret, tp_params)
+    return sl_res, tp_res
+
+
+async def execute_trade(chat_id, trade_info, ctx):
+    """Реально открывает позицию на Binance Futures после подтверждения пользователя."""
+    keys = USER_KEYS.get(chat_id)
+    if not keys:
+        await ctx.bot.send_message(chat_id, "❌ API ключи не найдены.")
+        return
+
+    symbol = trade_info["symbol"]
+    direction = trade_info["direction"]
+    sl = trade_info["sl"]
+    tp1 = trade_info["tp1"]
+    entry = trade_info["entry"]
+
+    balance = get_futures_balance(keys["api_key"], keys["api_secret"])
+    if not balance or balance < 10:
+        await ctx.bot.send_message(chat_id, "❌ Недостаточно средств на фьючерсном балансе (минимум $10).")
+        return
+
+    risk_pct = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
+    risk_usdt = balance * risk_pct / 100
+    price_precision, qty_precision, min_qty = get_symbol_info(symbol)
+
+    atr_risk_price = abs(entry - sl)
+    if atr_risk_price <= 0:
+        await ctx.bot.send_message(chat_id, "❌ Ошибка расчёта риска (SL = цена входа).")
+        return
+
+    # qty = сколько монет купить, чтобы при достижении SL потерять ровно risk_usdt
+    qty = risk_usdt / atr_risk_price
+    qty = max(round(qty, qty_precision), min_qty or 0.001)
+
+    set_leverage(symbol, DEFAULT_LEVERAGE, keys["api_key"], keys["api_secret"])
+
+    side = "BUY" if direction == "long" else "SELL"
+    order = place_futures_market_order(symbol, side, qty, qty_precision,
+                                       keys["api_key"], keys["api_secret"])
+
+    if not order or "orderId" not in order:
+        err = (order or {}).get("msg", "нет ответа от биржи")
+        await ctx.bot.send_message(chat_id, f"❌ Ошибка открытия позиции: `{err}`", parse_mode="Markdown")
+        return
+
+    fill_price = float(order.get("avgPrice") or entry)
+    if fill_price == 0:
+        fill_price = entry
+
+    sl_res, tp_res = place_sl_tp_orders(
+        symbol, direction, sl, tp1, qty,
+        price_precision, qty_precision,
+        keys["api_key"], keys["api_secret"]
+    )
+    sl_ok = sl_res and "orderId" in sl_res
+    tp_ok = tp_res and "orderId" in tp_res
+
+    OPEN_AUTOTRADES.setdefault(chat_id, []).append({
+        **trade_info,
+        "entry": fill_price,
+        "qty": qty,
+        "order_id": order["orderId"],
+        "sl_order_id": sl_res.get("orderId") if sl_ok else None,
+        "tp_order_id": tp_res.get("orderId") if tp_ok else None,
+        "opened_at": datetime.utcnow().isoformat(),
+    })
+
+    dir_label = "🟢 LONG" if direction == "long" else "🔴 SHORT"
+    notional = qty * fill_price / DEFAULT_LEVERAGE
+
+    await ctx.bot.send_message(
+        chat_id,
+        f"✅ *Позиция открыта!*\n\n"
+        f"{dir_label} *{symbol.replace('USDT', '')}*\n"
+        f"💵 Вход: `{fmt_price(fill_price)}`\n"
+        f"📦 Объём: `{qty}` (~`${notional:,.2f} USDT` маржи)\n"
+        f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n"
+        f"🛑 SL: `{fmt_price(sl)}` {'✅' if sl_ok else '⚠️ не выставлен!'}\n"
+        f"🎯 TP: `{fmt_price(tp1)}` {'✅' if tp_ok else '⚠️ не выставлен!'}\n\n"
+        f"Используй `/autoportfolio` для отслеживания.\n"
+        f"⚠️ _Торговля связана с риском потери средств._",
+        parse_mode="Markdown"
+    )
+
+
+# ─── Автоторговля: команды ────────────────────────────────────────────────────
+
+async def autotrade_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /autotrade on [risk%]  — включить (риск в % от баланса, по умолчанию 1%)
+    /autotrade off         — выключить
+    /autotrade status      — текущий статус
+    """
+    chat_id = update.effective_chat.id
+    args = ctx.args
+
+    if not args:
+        await update.message.reply_text(
+            "📟 *Автоторговля (фьючерсы)*\n\n"
+            "• `/autotrade on` — включить (риск 1% на сделку)\n"
+            "• `/autotrade on 2` — включить с риском 2%\n"
+            "• `/autotrade off` — выключить\n"
+            "• `/autotrade status` — текущий статус\n\n"
+            "⚠️ Требует API ключ с правом *Futures Trading*.\n"
+            "Добавь через `/setkey` если ещё не сделал.",
+            parse_mode="Markdown"
+        )
+        return
+
+    cmd = args[0].lower()
+
+    if cmd == "off":
+        AUTOTRADE_ENABLED[chat_id] = False
+        await update.message.reply_text("🔴 Автоторговля выключена.")
+        return
+
+    if cmd == "status":
+        enabled = AUTOTRADE_ENABLED.get(chat_id, False)
+        risk = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
+        open_trades = OPEN_AUTOTRADES.get(chat_id, [])
+        pending = sum(1 for t in PENDING_TRADES.values() if True)  # все pending
+        lines = [
+            f"📟 *Статус автоторговли*\n",
+            f"Состояние: {'🟢 Включена' if enabled else '🔴 Выключена'}",
+            f"Риск на сделку: `{risk}%`",
+            f"Плечо: `x{DEFAULT_LEVERAGE}`",
+            f"Порог сигнала: `≥ {AUTOTRADE_SCORE_THRESHOLD}` из ±15",
+            f"Открытых авто-позиций: `{len(open_trades)}`",
+        ]
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    if cmd == "on":
+        if chat_id not in USER_KEYS:
+            await update.message.reply_text(
+                "❌ Сначала добавь API ключ: `/setkey API_KEY API_SECRET`\n"
+                "Ключ должен иметь право *Futures Trading* (не Withdrawal!).",
+                parse_mode="Markdown"
+            )
+            return
+
+        risk = 1.0
+        if len(args) > 1:
+            try:
+                risk = float(args[1])
+                if not (0.1 <= risk <= 5):
+                    await update.message.reply_text("❌ Риск должен быть от 0.1% до 5%.")
+                    return
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Неверный формат. Пример: `/autotrade on 1.5`",
+                    parse_mode="Markdown"
+                )
+                return
+
+        keys = USER_KEYS[chat_id]
+        bal = get_futures_balance(keys["api_key"], keys["api_secret"])
+        if bal is None:
+            await update.message.reply_text(
+                "❌ Не удалось получить фьючерсный баланс.\n"
+                "Убедись что ключ имеет право *Futures Trading*.",
+                parse_mode="Markdown"
+            )
+            return
+
+        AUTOTRADE_ENABLED[chat_id] = True
+        AUTOTRADE_RISK_PCT[chat_id] = risk
+
+        await update.message.reply_text(
+            f"✅ *Автоторговля включена*\n\n"
+            f"💰 Баланс фьючерсов: `${bal:,.2f} USDT`\n"
+            f"⚖️ Риск на сделку: `{risk}%` ≈ `${bal * risk / 100:,.2f} USDT`\n"
+            f"🔢 Плечо: `x{DEFAULT_LEVERAGE}`\n"
+            f"📊 Порог сигнала: score `≥ {AUTOTRADE_SCORE_THRESHOLD}` (из ±15)\n"
+            f"🔄 Скан каждые 15 мин\n\n"
+            f"При сильном сигнале бот пришлёт карточку с кнопками "
+            f"✅ *Войти* / ❌ *Отмена*.\n\n"
+            f"⚠️ _Это реальные сделки на реальные деньги. "
+            f"Ты несёшь полную ответственность за результат._",
+            parse_mode="Markdown"
+        )
+        return
+
+    await update.message.reply_text(
+        "❓ Неизвестная команда.\nИспользуй: `/autotrade on/off/status`",
+        parse_mode="Markdown"
+    )
+
+
+async def autoportfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/autoportfolio — список открытых авто-позиций с live PnL."""
+    chat_id = update.effective_chat.id
+    trades = OPEN_AUTOTRADES.get(chat_id, [])
+    if not trades:
+        await update.message.reply_text("📭 Нет открытых авто-позиций.")
+        return
+
+    if chat_id not in USER_KEYS:
+        await update.message.reply_text("❌ Ключи не найдены. `/setkey API_KEY API_SECRET`", parse_mode="Markdown")
+        return
+
+    keys = USER_KEYS[chat_id]
+    data = futures_signed_request("GET", "account", keys["api_key"], keys["api_secret"])
+    live_pnl = {}
+    if data and "positions" in data:
+        for p in data["positions"]:
+            if float(p.get("positionAmt", 0)) != 0:
+                live_pnl[p["symbol"]] = float(p["unrealizedProfit"])
+
+    lines = ["📊 *Авто-позиции*\n"]
+    total_pnl = 0.0
+    for t in trades:
+        sym = t["symbol"]
+        direction = "🟢 LONG" if t["direction"] == "long" else "🔴 SHORT"
+        pnl = live_pnl.get(sym, 0.0)
+        total_pnl += pnl
+        pnl_str = f"📈 +${pnl:,.2f}" if pnl >= 0 else f"📉 -${abs(pnl):,.2f}"
+        lines.append(
+            f"*{sym.replace('USDT','')}* {direction}\n"
+            f"  Вход: `{fmt_price(t['entry'])}` | "
+            f"SL: `{fmt_price(t['sl'])}` | TP: `{fmt_price(t['tp1'])}`\n"
+            f"  PnL: `{pnl_str}`\n"
+        )
+    pnl_total_str = f"+${total_pnl:,.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):,.2f}"
+    lines.append(f"*Итого PnL:* `{pnl_total_str} USDT`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ─── Автоторговля: фоновый сканер ────────────────────────────────────────────
+
+async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """Каждые 15 мин ищет сигналы для пользователей с активной автоторговлей."""
+    import uuid
+    active_users = [cid for cid, on in AUTOTRADE_ENABLED.items() if on]
+    if not active_users:
+        return
+
+    loop = asyncio.get_running_loop()
+    longs, shorts = await loop.run_in_executor(None, scan_market)
+    candidates = longs + shorts
+
+    for chat_id in active_users:
+        if chat_id not in USER_KEYS:
+            continue
+
+        open_symbols = {t["symbol"] for t in OPEN_AUTOTRADES.get(chat_id, [])}
+
+        for candidate in candidates:
+            symbol = candidate["symbol"]
+            score = candidate["score"]
+
+            if symbol in open_symbols:
+                continue
+            if abs(score) < AUTOTRADE_SCORE_THRESHOLD:
+                continue
+
+            # Уточняем SL/TP по ATR с 1H данными
+            k1h = get_klines(symbol, "1h", 100)
+            if not k1h:
+                continue
+            df1h = klines_to_df(k1h)
+            atr = calc_atr(df1h, 14).iloc[-1]
+            price = df1h["close"].iloc[-1]
+            risk = atr * 1.5
+            direction = "long" if score > 0 else "short"
+
+            if direction == "long":
+                sl, tp1, tp2 = price - risk, price + risk * 1.5, price + risk * 3.0
+                dir_label = "🟢 LONG"
+            else:
+                sl, tp1, tp2 = price + risk, price - risk * 1.5, price - risk * 3.0
+                dir_label = "🔴 SHORT"
+
+            trade_id = str(uuid.uuid4())[:8]
+            PENDING_TRADES[trade_id] = {
+                "symbol": symbol, "direction": direction,
+                "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2, "score": score,
+            }
+
+            keys = USER_KEYS[chat_id]
+            bal = get_futures_balance(keys["api_key"], keys["api_secret"]) or 0
+            risk_pct = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
+            risk_usdt = bal * risk_pct / 100
+
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"✅ Войти (~${risk_usdt:.0f} риск)",
+                    callback_data=f"trade_confirm:{trade_id}"
+                ),
+                InlineKeyboardButton("❌ Отмена", callback_data=f"trade_cancel:{trade_id}"),
+            ]])
+
+            try:
+                await ctx.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🤖 *Авто-сигнал: {dir_label}*\n\n"
+                        f"💎 *{symbol.replace('USDT', '')}*\n"
+                        f"📊 Счёт: `{score:+.1f}` / ±15\n"
+                        f"💵 Цена: `{fmt_price(price)}`\n"
+                        f"🛑 SL: `{fmt_price(sl)}`\n"
+                        f"🎯 TP1: `{fmt_price(tp1)}`\n"
+                        f"🎯 TP2: `{fmt_price(tp2)}`\n"
+                        f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n"
+                        f"💰 Риск: `~${risk_usdt:.2f} USDT` ({risk_pct}%)\n\n"
+                        f"⏳ _Актуально ~15 минут_\n"
+                        f"⚠️ _Реальная сделка на реальные деньги_"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=kb
+                )
+                break  # один сигнал за раз на пользователя
+            except Exception as e:
+                logger.warning(f"autotrade_scan_job {chat_id}: {e}")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1472,6 +1903,8 @@ def main():
     app.add_handler(CommandHandler("futures", futures))
     app.add_handler(CommandHandler("top", top))
     app.add_handler(CommandHandler("info", info))
+    app.add_handler(CommandHandler("autotrade", autotrade_cmd))
+    app.add_handler(CommandHandler("autoportfolio", autoportfolio))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_error_handler(global_error_handler)
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
@@ -1479,6 +1912,8 @@ def main():
     # Фоновые задачи: проверка подписанных монет каждые 10 мин, рыночный скан каждый час
     app.job_queue.run_repeating(alert_job, interval=600, first=30)
     app.job_queue.run_repeating(market_scan_job, interval=3600, first=60)
+    # Автоторговля: скан каждые 15 минут
+    app.job_queue.run_repeating(autotrade_scan_job, interval=900, first=90)
 
     logger.info("Бот запущен...")
     app.run_polling()
