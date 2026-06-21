@@ -29,6 +29,7 @@ BINANCE_FUTURES_API = "https://fapi.binance.com/fapi/v1"
 # ─── Режим торговли (demo / real) ─────────────────────────────────────────────
 REAL_FUTURES_API = "https://fapi.binance.com/fapi/v1"
 DEMO_FUTURES_API = "https://demo-fapi.binance.com/fapi/v1"
+DEMO_FUTURES_API_V2 = "https://demo-fapi.binance.com/fapi/v2"
 USER_MODE: dict[int, str] = {}   # chat_id -> "real" | "demo"  (default: "real")
 
 def get_futures_api(chat_id: int) -> str:
@@ -1051,9 +1052,23 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mode = USER_MODE.get(user_id, "real")
 
     if mode == "demo":
-        # Для демо проверяем через фьючерсный демо-эндпоинт
-        test = futures_signed_request("GET", "account", api_key, api_secret, chat_id=user_id)
-        ok = test is not None and "assets" in (test or {})
+        # Для демо пробуем v2 потом v1
+        ok = False
+        for base in [DEMO_FUTURES_API_V2, DEMO_FUTURES_API]:
+            params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
+            query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+            signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+            params["signature"] = signature
+            headers = {"X-MBX-APIKEY": api_key}
+            try:
+                r = requests.get(f"{base}/account", params=params, headers=headers, timeout=10)
+                data = r.json()
+                if data and "assets" in data:
+                    ok = True
+                    break
+                logger.info(f"setkey demo {base} response: {data}")
+            except Exception as e:
+                logger.warning(f"setkey demo {base}: {e}")
     else:
         # Для реального — через спотовый API
         test = signed_request("GET", f"{BINANCE_API}/account", api_key, api_secret)
@@ -1530,6 +1545,27 @@ def futures_signed_request(method, endpoint, api_key, api_secret, params=None, c
 
 def get_futures_balance(api_key, api_secret, chat_id=None):
     """Возвращает доступный USDT баланс на фьючерсном аккаунте."""
+    mode = USER_MODE.get(chat_id, "real") if chat_id else "real"
+
+    if mode == "demo":
+        # demo-fapi использует v2 для account
+        for base in [DEMO_FUTURES_API_V2, DEMO_FUTURES_API]:
+            params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
+            query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+            signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+            params["signature"] = signature
+            headers = {"X-MBX-APIKEY": api_key}
+            try:
+                r = requests.get(f"{base}/account", params=params, headers=headers, timeout=10)
+                data = r.json()
+                if data and "assets" in data:
+                    for asset in data["assets"]:
+                        if asset["asset"] == "USDT":
+                            return float(asset["availableBalance"])
+            except Exception as e:
+                logger.warning(f"get_futures_balance demo {base}: {e}")
+        return None
+
     data = futures_signed_request("GET", "account", api_key, api_secret, chat_id=chat_id)
     if not data or "assets" not in data:
         return None
