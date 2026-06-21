@@ -1057,7 +1057,10 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Testnet-ключи валидны только на testnet.binancefuture.com,
         # проверяем через futures-баланс (V2), а не через спотовый /account.
         params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
-        query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        # ВАЖНО: строка для подписи должна быть в ТОМ ЖЕ порядке, в котором параметры
+        # реально уйдут в запросе (params.items(), без sorted) — иначе подпись не совпадёт
+        # с тем, что Binance пересчитает на своей стороне, и ключи будут отклонены всегда.
+        query_string = "&".join(f"{k}={v}" for k, v in params.items())
         signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
         params["signature"] = signature
         headers = {"X-MBX-APIKEY": api_key}
@@ -1522,7 +1525,8 @@ def futures_signed_request(method, endpoint, api_key, api_secret, params=None, c
     params = params or {}
     params["timestamp"] = int(time.time() * 1000)
     params["recvWindow"] = 5000
-    query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    # Подписываем в том же порядке, в котором параметры реально уйдут в запросе
+    query_string = "&".join(f"{k}={v}" for k, v in params.items())
     signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
     params["signature"] = signature
     headers = {"X-MBX-APIKEY": api_key}
@@ -1549,7 +1553,7 @@ def get_futures_balance(api_key, api_secret, chat_id=None):
     if mode == "demo":
         # demo-fapi поддерживает /fapi/v2/balance (не /account)
         params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
-        query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        query_string = "&".join(f"{k}={v}" for k, v in params.items())
         signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
         params["signature"] = signature
         headers = {"X-MBX-APIKEY": api_key}
