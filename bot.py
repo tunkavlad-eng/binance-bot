@@ -1062,11 +1062,11 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             params["signature"] = signature
             headers = {"X-MBX-APIKEY": api_key}
             try:
-                r = requests.get(f"{base}/account", params=params, headers=headers, timeout=10)
+                r = requests.get(f"{base}/balance", params=params, headers=headers, timeout=10)
                 data = r.json()
-                last_response = f"{base} → HTTP {r.status_code}: {str(data)[:200]}"
-                logger.info(f"setkey demo {base} response: {data}")
-                if data and "assets" in data:
+                last_response = f"{base}/balance → HTTP {r.status_code}: {str(data)[:200]}"
+                logger.info(f"setkey demo {base}/balance response: {data}")
+                if isinstance(data, list) or (data and "assets" in data):
                     ok = True
                     break
             except Exception as e:
@@ -1553,7 +1553,7 @@ def get_futures_balance(api_key, api_secret, chat_id=None):
     mode = USER_MODE.get(chat_id, "real") if chat_id else "real"
 
     if mode == "demo":
-        # demo-fapi использует v3 для account
+        # demo-fapi поддерживает /fapi/v3/balance (не /account)
         for base in [DEMO_FUTURES_API_V3, DEMO_FUTURES_API_V2, DEMO_FUTURES_API]:
             params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
             query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
@@ -1561,13 +1561,17 @@ def get_futures_balance(api_key, api_secret, chat_id=None):
             params["signature"] = signature
             headers = {"X-MBX-APIKEY": api_key}
             try:
-                r = requests.get(f"{base}/account", params=params, headers=headers, timeout=10)
+                r = requests.get(f"{base}/balance", params=params, headers=headers, timeout=10)
                 data = r.json()
-                if data and "assets" in data:
+                logger.info(f"get_futures_balance demo {base}/balance: {str(data)[:150]}")
+                if isinstance(data, list):
+                    for asset in data:
+                        if asset.get("asset") == "USDT":
+                            return float(asset["availableBalance"])
+                elif data and "assets" in data:
                     for asset in data["assets"]:
                         if asset["asset"] == "USDT":
                             return float(asset["availableBalance"])
-                logger.info(f"get_futures_balance demo {base}: {str(data)[:100]}")
             except Exception as e:
                 logger.warning(f"get_futures_balance demo {base}: {e}")
         return None
