@@ -30,6 +30,7 @@ BINANCE_FUTURES_API = "https://fapi.binance.com/fapi/v1"
 REAL_FUTURES_API = "https://fapi.binance.com/fapi/v1"
 DEMO_FUTURES_API = "https://demo-fapi.binance.com/fapi/v1"
 DEMO_FUTURES_API_V2 = "https://demo-fapi.binance.com/fapi/v2"
+DEMO_FUTURES_API_V3 = "https://demo-fapi.binance.com/fapi/v3"
 USER_MODE: dict[int, str] = {}   # chat_id -> "real" | "demo"  (default: "real")
 
 def get_futures_api(chat_id: int) -> str:
@@ -1054,7 +1055,7 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if mode == "demo":
         ok = False
         last_response = None
-        for base in [DEMO_FUTURES_API_V2, DEMO_FUTURES_API]:
+        for base in [DEMO_FUTURES_API_V3, DEMO_FUTURES_API_V2, DEMO_FUTURES_API]:
             params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
             query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
             signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
@@ -1552,8 +1553,8 @@ def get_futures_balance(api_key, api_secret, chat_id=None):
     mode = USER_MODE.get(chat_id, "real") if chat_id else "real"
 
     if mode == "demo":
-        # demo-fapi использует v2 для account
-        for base in [DEMO_FUTURES_API_V2, DEMO_FUTURES_API]:
+        # demo-fapi использует v3 для account
+        for base in [DEMO_FUTURES_API_V3, DEMO_FUTURES_API_V2, DEMO_FUTURES_API]:
             params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
             query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
             signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
@@ -1566,6 +1567,7 @@ def get_futures_balance(api_key, api_secret, chat_id=None):
                     for asset in data["assets"]:
                         if asset["asset"] == "USDT":
                             return float(asset["availableBalance"])
+                logger.info(f"get_futures_balance demo {base}: {str(data)[:100]}")
             except Exception as e:
                 logger.warning(f"get_futures_balance demo {base}: {e}")
         return None
