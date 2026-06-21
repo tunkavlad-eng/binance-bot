@@ -28,9 +28,8 @@ BINANCE_FUTURES_API = "https://fapi.binance.com/fapi/v1"
 USER_KEYS: dict[int, dict] = {}
 
 # ─── Режим торговли (demo / real) ─────────────────────────────────────────────
-REAL_FUTURES_API = "https://fapi.binance.com/fapi/v1"
-DEMO_FUTURES_API = "https://demo-fapi.binance.com/fapi/v1"
-DEMO_FUTURES_API_V2 = "https://demo-fapi.binance.com/fapi/v2"
+REAL_FUTURES_API = "https://fapi.binance.com"
+DEMO_FUTURES_API = "https://demo-fapi.binance.com"
 USER_MODE: dict[int, str] = {}   # chat_id -> "real" | "demo"  (default: "real")
 
 def get_futures_api(chat_id: int) -> str:
@@ -1055,7 +1054,7 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if mode == "demo":
         # Demo Trading ключи (demo.binance.com, вход через основной аккаунт Binance)
-        # валидны на demo-fapi.binance.com, проверяем через futures-баланс (V2).
+        # валидны на demo-fapi.binance.com, проверяем через futures-баланс (V3).
         params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
         # ВАЖНО: строка для подписи должна быть в ТОМ ЖЕ порядке, в котором параметры
         # реально уйдут в запросе (params.items(), без sorted) — иначе подпись не совпадёт
@@ -1065,7 +1064,7 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         params["signature"] = signature
         headers = {"X-MBX-APIKEY": api_key}
         try:
-            r = requests.get(f"{DEMO_FUTURES_API_V2}/balance", params=params, headers=headers, timeout=10)
+            r = requests.get(f"{DEMO_FUTURES_API}/fapi/v3/balance", params=params, headers=headers, timeout=10)
             data = r.json()
             ok = isinstance(data, list)
         except Exception as e:
@@ -1149,7 +1148,7 @@ async def positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text("⏳ Получаю позиции...")
     keys = USER_KEYS[user_id]
-    data = futures_signed_request("GET", "account", keys["api_key"], keys["api_secret"], chat_id=user_id)
+    data = futures_signed_request("GET", "fapi/v3/account", keys["api_key"], keys["api_secret"], chat_id=user_id)
 
     if not data or "code" in data:
         await msg.edit_text("❌ Ошибка. Нужны права на Futures.", parse_mode="Markdown")
@@ -1551,14 +1550,14 @@ def get_futures_balance(api_key, api_secret, chat_id=None):
     mode = USER_MODE.get(chat_id, "real") if chat_id else "real"
 
     if mode == "demo":
-        # demo-fapi поддерживает /fapi/v2/balance (не /account)
+        # demo-fapi поддерживает /fapi/v3/balance
         params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
         query_string = "&".join(f"{k}={v}" for k, v in params.items())
         signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
         params["signature"] = signature
         headers = {"X-MBX-APIKEY": api_key}
         try:
-            r = requests.get(f"{DEMO_FUTURES_API_V2}/balance", params=params, headers=headers, timeout=10)
+            r = requests.get(f"{DEMO_FUTURES_API}/fapi/v3/balance", params=params, headers=headers, timeout=10)
             data = r.json()
             if isinstance(data, list):
                 for asset in data:
@@ -1568,7 +1567,7 @@ def get_futures_balance(api_key, api_secret, chat_id=None):
             logger.warning(f"get_futures_balance demo: {e}")
         return None
 
-    data = futures_signed_request("GET", "account", api_key, api_secret, chat_id=chat_id)
+    data = futures_signed_request("GET", "fapi/v3/account", api_key, api_secret, chat_id=chat_id)
     if not data or "assets" not in data:
         return None
     for asset in data["assets"]:
@@ -1581,7 +1580,7 @@ def get_symbol_info(symbol, chat_id=None):
     """Получает точность цены/количества и минимальный лот для символа."""
     try:
         base = get_futures_api(chat_id) if chat_id else REAL_FUTURES_API
-        r = requests.get(f"{base}/exchangeInfo", timeout=10)
+        r = requests.get(f"{base}/fapi/v1/exchangeInfo", timeout=10)
         r.raise_for_status()
         for s in r.json()["symbols"]:
             if s["symbol"] == symbol:
@@ -1598,14 +1597,14 @@ def get_symbol_info(symbol, chat_id=None):
 
 
 def set_leverage(symbol, leverage, api_key, api_secret, chat_id=None):
-    return futures_signed_request("POST", "leverage", api_key, api_secret,
+    return futures_signed_request("POST", "fapi/v1/leverage", api_key, api_secret,
                                    {"symbol": symbol, "leverage": leverage}, chat_id=chat_id)
 
 
 def place_futures_market_order(symbol, side, quantity, qty_precision, api_key, api_secret, chat_id=None):
     """Открывает рыночный ордер на фьючерсах."""
     qty = round(quantity, qty_precision)
-    return futures_signed_request("POST", "order", api_key, api_secret, {
+    return futures_signed_request("POST", "fapi/v1/order", api_key, api_secret, {
         "symbol": symbol,
         "side": side,
         "type": "MARKET",
@@ -1629,8 +1628,8 @@ def place_sl_tp_orders(symbol, direction, sl_price, tp_price, quantity,
         "quantity": qty, "stopPrice": round(tp_price, price_precision),
         "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
     }
-    sl_res = futures_signed_request("POST", "order", api_key, api_secret, sl_params, chat_id=chat_id)
-    tp_res = futures_signed_request("POST", "order", api_key, api_secret, tp_params, chat_id=chat_id)
+    sl_res = futures_signed_request("POST", "fapi/v1/order", api_key, api_secret, sl_params, chat_id=chat_id)
+    tp_res = futures_signed_request("POST", "fapi/v1/order", api_key, api_secret, tp_params, chat_id=chat_id)
     return sl_res, tp_res
 
 
@@ -1838,7 +1837,7 @@ async def autoportfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     keys = USER_KEYS[chat_id]
-    data = futures_signed_request("GET", "account", keys["api_key"], keys["api_secret"], chat_id=chat_id)
+    data = futures_signed_request("GET", "fapi/v3/account", keys["api_key"], keys["api_secret"], chat_id=chat_id)
     live_pnl = {}
     if data and "positions" in data:
         for p in data["positions"]:
