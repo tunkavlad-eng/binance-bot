@@ -29,7 +29,7 @@ USER_KEYS: dict[int, dict] = {}
 
 # ─── Режим торговли (demo / real) ─────────────────────────────────────────────
 REAL_FUTURES_API = "https://fapi.binance.com"
-DEMO_FUTURES_API = "https://demo.binance.com"
+DEMO_FUTURES_API = "https://demo-fapi.binance.com"
 USER_MODE: dict[int, str] = {}   # chat_id -> "real" | "demo"  (default: "real")
 
 def get_futures_api(chat_id: int) -> str:
@@ -1051,6 +1051,7 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     api_key, api_secret = ctx.args[0], ctx.args[1]
     mode = USER_MODE.get(user_id, "real")
+    error_detail = ""
 
     if mode == "demo":
         # Demo Trading ключи (demo.binance.com, вход через основной аккаунт Binance)
@@ -1067,13 +1068,19 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             r = requests.get(f"{DEMO_FUTURES_API}/fapi/v3/balance", params=params, headers=headers, timeout=10)
             data = r.json()
             ok = isinstance(data, list)
+            if not ok:
+                error_detail = f"HTTP {r.status_code}: `{data}`"
+                logger.warning(f"setkey demo check failed: status={r.status_code} body={data}")
         except Exception as e:
             logger.warning(f"setkey demo check error: {e}")
+            error_detail = f"Исключение: `{e}`"
             ok = False
     else:
         # Для реального — через спотовый API, как раньше
         test = signed_request("GET", f"{BINANCE_API}/account", api_key, api_secret)
         ok = test is not None and "code" not in (test or {})
+        if not ok:
+            error_detail = f"`{test}`"
 
     if not ok:
         mode_hint = "демо (demo.binance.com — Demo Trading в твоём основном аккаунте)" if mode == "demo" else "реального Binance"
@@ -1081,7 +1088,8 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"❌ Неверные ключи или недостаточно прав.\n\n"
             f"Режим сейчас: *{'🧪 DEMO' if mode == 'demo' else '💰 REAL'}*\n"
             f"Убедись что ключи от {mode_hint}.\n\n"
-            f"Сменить режим: `/mode demo` или `/mode real`",
+            f"Сменить режим: `/mode demo` или `/mode real`\n\n"
+            f"🔍 Ответ Binance: {error_detail or 'нет деталей'}",
             parse_mode="Markdown"
         )
         return
