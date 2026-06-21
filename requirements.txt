@@ -1,4 +1,4 @@
-python-telegram-bot[job-queue]==20.7
-requests==2.31.0
-matplotlib==3.8.2
-pandas==2.1.4
+python-telegram-bot[job-queue]>=21.0
+requests>=2.31.0
+matplotlib>=3.8.2
+pandas>=2.2.0
