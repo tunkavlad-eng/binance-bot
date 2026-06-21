@@ -29,7 +29,7 @@ USER_KEYS: dict[int, dict] = {}
 
 # ─── Режим торговли (demo / real) ─────────────────────────────────────────────
 REAL_FUTURES_API = "https://fapi.binance.com"
-DEMO_FUTURES_API = "https://demo-fapi.binance.com"
+DEMO_FUTURES_API = "https://demo.binance.com"
 USER_MODE: dict[int, str] = {}   # chat_id -> "real" | "demo"  (default: "real")
 
 def get_futures_api(chat_id: int) -> str:
