@@ -40,6 +40,9 @@ PENDING_TRADES: dict[str, dict] = {}          # trade_id -> данные сде�
 OPEN_AUTOTRADES: dict[int, list] = {}         # chat_id -> список открытых авто-позиций
 AUTOTRADE_SCORE_THRESHOLD = 6.0              # порог сигнала (чуть выше алертного)
 DEFAULT_LEVERAGE = 3                          # плечо по умолчанию
+AUTOTRADE_LEVERAGE: dict[int, int] = {}      # chat_id -> плечо (1–20)
+# Настройки ожидающей сделки до входа: trade_id -> {risk_pct, leverage}
+PENDING_TRADE_SETTINGS: dict[str, dict] = {}
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1279,6 +1282,50 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             args = [symbol]
         await analyze(FU(), FC())
 
+    elif action == "noop":
+        pass  # кнопка-лейбл, ничего не делаем
+
+    elif action in ("trade_risk_up", "trade_risk_down", "trade_lev_up", "trade_lev_down"):
+        trade_id = symbol
+        trade_info = PENDING_TRADES.get(trade_id)
+        settings = PENDING_TRADE_SETTINGS.get(trade_id)
+        if not trade_info or not settings:
+            await query.message.edit_text("⚠️ Сигнал устарел или уже обработан.")
+            return
+
+        chat_id = query.from_user.id
+        keys = USER_KEYS.get(chat_id)
+        bal = (get_futures_balance(keys["api_key"], keys["api_secret"]) or 0) if keys else 0
+
+        if action == "trade_risk_up":
+            settings["risk_pct"] = min(round(settings["risk_pct"] + 0.5, 1), 20.0)
+        elif action == "trade_risk_down":
+            settings["risk_pct"] = max(round(settings["risk_pct"] - 0.5, 1), 0.5)
+        elif action == "trade_lev_up":
+            settings["leverage"] = min(settings["leverage"] + 1, 20)
+        elif action == "trade_lev_down":
+            settings["leverage"] = max(settings["leverage"] - 1, 1)
+
+        risk_usdt = bal * settings["risk_pct"] / 100
+        t = trade_info
+        price, sl, tp1, tp2 = t["entry"], t["sl"], t["tp1"], t["tp2"]
+        score = t["score"]
+        dir_label = "🟢 LONG" if t["direction"] == "long" else "🔴 SHORT"
+        sym = t["symbol"]
+
+        try:
+            await query.message.edit_text(
+                build_trade_card_text(sym, score, price, sl, tp1, tp2,
+                                      settings["risk_pct"], settings["leverage"],
+                                      risk_usdt, dir_label),
+                parse_mode="Markdown",
+                reply_markup=build_trade_keyboard(trade_id, settings["risk_pct"],
+                                                  settings["leverage"], risk_usdt)
+            )
+        except Exception as e:
+            if "Message is not modified" not in str(e):
+                logger.warning(f"trade settings edit error: {e}")
+
     elif action == "trade_confirm":
         trade_id = symbol  # здесь symbol содержит trade_id
         trade_info = PENDING_TRADES.pop(trade_id, None)
@@ -1582,7 +1629,9 @@ async def execute_trade(chat_id, trade_info, ctx):
         await ctx.bot.send_message(chat_id, "❌ Недостаточно средств на фьючерсном балансе (минимум $10).")
         return
 
-    risk_pct = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
+    trade_settings = PENDING_TRADE_SETTINGS.pop(trade_info.get("trade_id", ""), {})
+    risk_pct = trade_settings.get("risk_pct", AUTOTRADE_RISK_PCT.get(chat_id, 1.0))
+    leverage = trade_settings.get("leverage", AUTOTRADE_LEVERAGE.get(chat_id, DEFAULT_LEVERAGE))
     risk_usdt = balance * risk_pct / 100
     price_precision, qty_precision, min_qty = get_symbol_info(symbol)
 
@@ -1595,7 +1644,7 @@ async def execute_trade(chat_id, trade_info, ctx):
     qty = risk_usdt / atr_risk_price
     qty = max(round(qty, qty_precision), min_qty or 0.001)
 
-    set_leverage(symbol, DEFAULT_LEVERAGE, keys["api_key"], keys["api_secret"])
+    set_leverage(symbol, leverage, keys["api_key"], keys["api_secret"])
 
     side = "BUY" if direction == "long" else "SELL"
     order = place_futures_market_order(symbol, side, qty, qty_precision,
@@ -1629,7 +1678,7 @@ async def execute_trade(chat_id, trade_info, ctx):
     })
 
     dir_label = "🟢 LONG" if direction == "long" else "🔴 SHORT"
-    notional = qty * fill_price / DEFAULT_LEVERAGE
+    notional = qty * fill_price / leverage
 
     await ctx.bot.send_message(
         chat_id,
@@ -1637,7 +1686,8 @@ async def execute_trade(chat_id, trade_info, ctx):
         f"{dir_label} *{symbol.replace('USDT', '')}*\n"
         f"💵 Вход: `{fmt_price(fill_price)}`\n"
         f"📦 Объём: `{qty}` (~`${notional:,.2f} USDT` маржи)\n"
-        f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n"
+        f"⚖️ Плечо: `x{leverage}`\n"
+        f"💰 Риск: `{risk_pct}%` ≈ `~${risk_usdt:.2f} USDT`\n"
         f"🛑 SL: `{fmt_price(sl)}` {'✅' if sl_ok else '⚠️ не выставлен!'}\n"
         f"🎯 TP: `{fmt_price(tp1)}` {'✅' if tp_ok else '⚠️ не выставлен!'}\n\n"
         f"Используй `/autoportfolio` для отслеживания.\n"
@@ -1680,13 +1730,13 @@ async def autotrade_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if cmd == "status":
         enabled = AUTOTRADE_ENABLED.get(chat_id, False)
         risk = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
+        leverage = AUTOTRADE_LEVERAGE.get(chat_id, DEFAULT_LEVERAGE)
         open_trades = OPEN_AUTOTRADES.get(chat_id, [])
-        pending = sum(1 for t in PENDING_TRADES.values() if True)  # все pending
         lines = [
             f"📟 *Статус автоторговли*\n",
             f"Состояние: {'🟢 Включена' if enabled else '🔴 Выключена'}",
-            f"Риск на сделку: `{risk}%`",
-            f"Плечо: `x{DEFAULT_LEVERAGE}`",
+            f"Риск на сделку: `{risk}%` (можно менять в карточке сигнала)",
+            f"Плечо по умолчанию: `x{leverage}` (можно менять в карточке сигнала)",
             f"Порог сигнала: `≥ {AUTOTRADE_SCORE_THRESHOLD}` из ±15",
             f"Открытых авто-позиций: `{len(open_trades)}`",
         ]
@@ -1789,6 +1839,47 @@ async def autoportfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+# ─── Автоторговля: карточка сигнала ──────────────────────────────────────────
+
+def build_trade_card_text(symbol, score, price, sl, tp1, tp2,
+                          risk_pct, leverage, risk_usdt, dir_label):
+    return (
+        f"🤖 *Авто-сигнал: {dir_label}*\n\n"
+        f"💎 *{symbol.replace('USDT', '')}*\n"
+        f"📊 Счёт: `{score:+.1f}` / ±15\n"
+        f"💵 Цена: `{fmt_price(price)}`\n"
+        f"🛑 SL: `{fmt_price(sl)}`\n"
+        f"🎯 TP1: `{fmt_price(tp1)}`\n"
+        f"🎯 TP2: `{fmt_price(tp2)}`\n\n"
+        f"⚖️ Плечо: `x{leverage}`\n"
+        f"💰 Риск: `{risk_pct}%` ≈ `~${risk_usdt:.2f} USDT`\n\n"
+        f"⏳ _Актуально ~15 минут_\n"
+        f"⚠️ _Реальная сделка на реальные деньги_"
+    )
+
+
+def build_trade_keyboard(trade_id, risk_pct, leverage, risk_usdt):
+    """Строит клавиатуру карточки сигнала с кнопками изменения плеча и риска."""
+    # Строка 1: изменение риска
+    risk_row = [
+        InlineKeyboardButton("💰 −0.5%", callback_data=f"trade_risk_down:{trade_id}"),
+        InlineKeyboardButton(f"Риск {risk_pct}% ≈ ${risk_usdt:.0f}", callback_data="noop"),
+        InlineKeyboardButton("💰 +0.5%", callback_data=f"trade_risk_up:{trade_id}"),
+    ]
+    # Строка 2: изменение плеча
+    lev_row = [
+        InlineKeyboardButton("⚖️ −1x", callback_data=f"trade_lev_down:{trade_id}"),
+        InlineKeyboardButton(f"Плечо x{leverage}", callback_data="noop"),
+        InlineKeyboardButton("⚖️ +1x", callback_data=f"trade_lev_up:{trade_id}"),
+    ]
+    # Строка 3: войти / отмена
+    action_row = [
+        InlineKeyboardButton(f"✅ Войти", callback_data=f"trade_confirm:{trade_id}"),
+        InlineKeyboardButton("❌ Отмена", callback_data=f"trade_cancel:{trade_id}"),
+    ]
+    return InlineKeyboardMarkup([risk_row, lev_row, action_row])
+
+
 # ─── Автоторговля: фоновый сканер ────────────────────────────────────────────
 
 async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
@@ -1838,37 +1929,23 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
             PENDING_TRADES[trade_id] = {
                 "symbol": symbol, "direction": direction,
                 "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2, "score": score,
+                "trade_id": trade_id,
             }
 
             keys = USER_KEYS[chat_id]
             bal = get_futures_balance(keys["api_key"], keys["api_secret"]) or 0
             risk_pct = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
+            leverage = AUTOTRADE_LEVERAGE.get(chat_id, DEFAULT_LEVERAGE)
+            PENDING_TRADE_SETTINGS[trade_id] = {"risk_pct": risk_pct, "leverage": leverage}
             risk_usdt = bal * risk_pct / 100
 
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    f"✅ Войти (~${risk_usdt:.0f} риск)",
-                    callback_data=f"trade_confirm:{trade_id}"
-                ),
-                InlineKeyboardButton("❌ Отмена", callback_data=f"trade_cancel:{trade_id}"),
-            ]])
+            kb = build_trade_keyboard(trade_id, risk_pct, leverage, risk_usdt)
 
             try:
                 await ctx.bot.send_message(
                     chat_id=chat_id,
-                    text=(
-                        f"🤖 *Авто-сигнал: {dir_label}*\n\n"
-                        f"💎 *{symbol.replace('USDT', '')}*\n"
-                        f"📊 Счёт: `{score:+.1f}` / ±15\n"
-                        f"💵 Цена: `{fmt_price(price)}`\n"
-                        f"🛑 SL: `{fmt_price(sl)}`\n"
-                        f"🎯 TP1: `{fmt_price(tp1)}`\n"
-                        f"🎯 TP2: `{fmt_price(tp2)}`\n"
-                        f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n"
-                        f"💰 Риск: `~${risk_usdt:.2f} USDT` ({risk_pct}%)\n\n"
-                        f"⏳ _Актуально ~15 минут_\n"
-                        f"⚠️ _Реальная сделка на реальные деньги_"
-                    ),
+                    text=build_trade_card_text(symbol, score, price, sl, tp1, tp2,
+                                               risk_pct, leverage, risk_usdt, dir_label),
                     parse_mode="Markdown",
                     reply_markup=kb
                 )
