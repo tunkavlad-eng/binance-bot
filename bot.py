@@ -1052,8 +1052,8 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mode = USER_MODE.get(user_id, "real")
 
     if mode == "demo":
-        # Для демо пробуем v2 потом v1
         ok = False
+        last_response = None
         for base in [DEMO_FUTURES_API_V2, DEMO_FUTURES_API]:
             params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
             query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
@@ -1063,11 +1063,13 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try:
                 r = requests.get(f"{base}/account", params=params, headers=headers, timeout=10)
                 data = r.json()
+                last_response = f"{base} → HTTP {r.status_code}: {str(data)[:200]}"
+                logger.info(f"setkey demo {base} response: {data}")
                 if data and "assets" in data:
                     ok = True
                     break
-                logger.info(f"setkey demo {base} response: {data}")
             except Exception as e:
+                last_response = f"{base} → Exception: {e}"
                 logger.warning(f"setkey demo {base}: {e}")
     else:
         # Для реального — через спотовый API
@@ -1076,11 +1078,13 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if not ok:
         mode_hint = "демо (demo-fapi.binance.com)" if mode == "demo" else "реального Binance"
+        debug = f"\n\n🔍 Ответ сервера:\n`{last_response}`" if mode == "demo" and last_response else ""
         await update.message.reply_text(
             f"❌ Неверные ключи или недостаточно прав.\n\n"
             f"Режим сейчас: *{'🧪 DEMO' if mode == 'demo' else '💰 REAL'}*\n"
             f"Убедись что ключи от {mode_hint}.\n\n"
-            f"Сменить режим: `/mode demo` или `/mode real`",
+            f"Сменить режим: `/mode demo` или `/mode real`"
+            f"{debug}",
             parse_mode="Markdown"
         )
         return
