@@ -25,6 +25,15 @@ logger = logging.getLogger(__name__)
 
 BINANCE_API = "https://api.binance.com/api/v3"
 BINANCE_FUTURES_API = "https://fapi.binance.com/fapi/v1"
+
+# ─── Режим торговли (demo / real) ─────────────────────────────────────────────
+REAL_FUTURES_API = "https://fapi.binance.com/fapi/v1"
+DEMO_FUTURES_API = "https://testnet.binancefuture.com/fapi/v1"
+USER_MODE: dict[int, str] = {}   # chat_id -> "real" | "demo"  (default: "real")
+
+def get_futures_api(chat_id: int) -> str:
+    return DEMO_FUTURES_API if USER_MODE.get(chat_id) == "demo" else REAL_FUTURES_API
+
 USER_KEYS: dict[int, dict] = {}
 
 # Подписки на алерты: chat_id -> set(symbols), плюс отдельный флаг подписки на скан рынка
@@ -40,9 +49,6 @@ PENDING_TRADES: dict[str, dict] = {}          # trade_id -> данные сде�
 OPEN_AUTOTRADES: dict[int, list] = {}         # chat_id -> список открытых авто-позиций
 AUTOTRADE_SCORE_THRESHOLD = 6.0              # порог сигнала (чуть выше алертного)
 DEFAULT_LEVERAGE = 3                          # плечо по умолчанию
-AUTOTRADE_LEVERAGE: dict[int, int] = {}      # chat_id -> плечо (1–20)
-# Настройки ожидающей сделки до входа: trade_id -> {risk_pct, leverage}
-PENDING_TRADE_SETTINGS: dict[str, dict] = {}
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1282,50 +1288,6 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             args = [symbol]
         await analyze(FU(), FC())
 
-    elif action == "noop":
-        pass  # кнопка-лейбл, ничего не делаем
-
-    elif action in ("trade_risk_up", "trade_risk_down", "trade_lev_up", "trade_lev_down"):
-        trade_id = symbol
-        trade_info = PENDING_TRADES.get(trade_id)
-        settings = PENDING_TRADE_SETTINGS.get(trade_id)
-        if not trade_info or not settings:
-            await query.message.edit_text("⚠️ Сигнал устарел или уже обработан.")
-            return
-
-        chat_id = query.from_user.id
-        keys = USER_KEYS.get(chat_id)
-        bal = (get_futures_balance(keys["api_key"], keys["api_secret"]) or 0) if keys else 0
-
-        if action == "trade_risk_up":
-            settings["risk_pct"] = min(round(settings["risk_pct"] + 0.5, 1), 20.0)
-        elif action == "trade_risk_down":
-            settings["risk_pct"] = max(round(settings["risk_pct"] - 0.5, 1), 0.5)
-        elif action == "trade_lev_up":
-            settings["leverage"] = min(settings["leverage"] + 1, 20)
-        elif action == "trade_lev_down":
-            settings["leverage"] = max(settings["leverage"] - 1, 1)
-
-        risk_usdt = bal * settings["risk_pct"] / 100
-        t = trade_info
-        price, sl, tp1, tp2 = t["entry"], t["sl"], t["tp1"], t["tp2"]
-        score = t["score"]
-        dir_label = "🟢 LONG" if t["direction"] == "long" else "🔴 SHORT"
-        sym = t["symbol"]
-
-        try:
-            await query.message.edit_text(
-                build_trade_card_text(sym, score, price, sl, tp1, tp2,
-                                      settings["risk_pct"], settings["leverage"],
-                                      risk_usdt, dir_label),
-                parse_mode="Markdown",
-                reply_markup=build_trade_keyboard(trade_id, settings["risk_pct"],
-                                                  settings["leverage"], risk_usdt)
-            )
-        except Exception as e:
-            if "Message is not modified" not in str(e):
-                logger.warning(f"trade settings edit error: {e}")
-
     elif action == "trade_confirm":
         trade_id = symbol  # здесь symbol содержит trade_id
         trade_info = PENDING_TRADES.pop(trade_id, None)
@@ -1520,7 +1482,7 @@ async def global_error_handler(update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── Автоторговля: helpers ────────────────────────────────────────────────────
 
-def futures_signed_request(method, endpoint, api_key, api_secret, params=None):
+def futures_signed_request(method, endpoint, api_key, api_secret, params=None, chat_id=None):
     """Подписанный запрос к Binance Futures API."""
     params = params or {}
     params["timestamp"] = int(time.time() * 1000)
@@ -1529,7 +1491,8 @@ def futures_signed_request(method, endpoint, api_key, api_secret, params=None):
     signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
     params["signature"] = signature
     headers = {"X-MBX-APIKEY": api_key}
-    url = f"https://fapi.binance.com/fapi/v1/{endpoint}"
+    base = get_futures_api(chat_id) if chat_id else REAL_FUTURES_API
+    url = f"{base}/{endpoint}"
     try:
         if method == "GET":
             r = requests.get(url, params=params, headers=headers, timeout=10)
@@ -1544,9 +1507,9 @@ def futures_signed_request(method, endpoint, api_key, api_secret, params=None):
         return None
 
 
-def get_futures_balance(api_key, api_secret):
+def get_futures_balance(api_key, api_secret, chat_id=None):
     """Возвращает доступный USDT баланс на фьючерсном аккаунте."""
-    data = futures_signed_request("GET", "account", api_key, api_secret)
+    data = futures_signed_request("GET", "account", api_key, api_secret, chat_id=chat_id)
     if not data or "assets" not in data:
         return None
     for asset in data["assets"]:
@@ -1555,10 +1518,11 @@ def get_futures_balance(api_key, api_secret):
     return None
 
 
-def get_symbol_info(symbol):
+def get_symbol_info(symbol, chat_id=None):
     """Получает точность цены/количества и минимальный лот для символа."""
     try:
-        r = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=10)
+        base = get_futures_api(chat_id) if chat_id else REAL_FUTURES_API
+        r = requests.get(f"{base}/exchangeInfo", timeout=10)
         r.raise_for_status()
         for s in r.json()["symbols"]:
             if s["symbol"] == symbol:
@@ -1574,12 +1538,12 @@ def get_symbol_info(symbol):
     return 2, 3, 0.001
 
 
-def set_leverage(symbol, leverage, api_key, api_secret):
+def set_leverage(symbol, leverage, api_key, api_secret, chat_id=None):
     return futures_signed_request("POST", "leverage", api_key, api_secret,
-                                   {"symbol": symbol, "leverage": leverage})
+                                   {"symbol": symbol, "leverage": leverage}, chat_id=chat_id)
 
 
-def place_futures_market_order(symbol, side, quantity, qty_precision, api_key, api_secret):
+def place_futures_market_order(symbol, side, quantity, qty_precision, api_key, api_secret, chat_id=None):
     """Открывает рыночный ордер на фьючерсах."""
     qty = round(quantity, qty_precision)
     return futures_signed_request("POST", "order", api_key, api_secret, {
@@ -1588,11 +1552,11 @@ def place_futures_market_order(symbol, side, quantity, qty_precision, api_key, a
         "type": "MARKET",
         "quantity": qty,
         "positionSide": "BOTH",
-    })
+    }, chat_id=chat_id)
 
 
 def place_sl_tp_orders(symbol, direction, sl_price, tp_price, quantity,
-                        price_precision, qty_precision, api_key, api_secret):
+                        price_precision, qty_precision, api_key, api_secret, chat_id=None):
     """Ставит STOP_MARKET (SL) и TAKE_PROFIT_MARKET (TP) ордера."""
     close_side = "SELL" if direction == "long" else "BUY"
     qty = round(quantity, qty_precision)
@@ -1606,8 +1570,8 @@ def place_sl_tp_orders(symbol, direction, sl_price, tp_price, quantity,
         "quantity": qty, "stopPrice": round(tp_price, price_precision),
         "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
     }
-    sl_res = futures_signed_request("POST", "order", api_key, api_secret, sl_params)
-    tp_res = futures_signed_request("POST", "order", api_key, api_secret, tp_params)
+    sl_res = futures_signed_request("POST", "order", api_key, api_secret, sl_params, chat_id=chat_id)
+    tp_res = futures_signed_request("POST", "order", api_key, api_secret, tp_params, chat_id=chat_id)
     return sl_res, tp_res
 
 
@@ -1623,8 +1587,10 @@ async def execute_trade(chat_id, trade_info, ctx):
     sl = trade_info["sl"]
     tp1 = trade_info["tp1"]
     entry = trade_info["entry"]
+    mode = USER_MODE.get(chat_id, "real")
+    mode_label = "🧪 DEMO" if mode == "demo" else "💰 REAL"
 
-    balance = get_futures_balance(keys["api_key"], keys["api_secret"])
+    balance = get_futures_balance(keys["api_key"], keys["api_secret"], chat_id=chat_id)
     if not balance or balance < 10:
         await ctx.bot.send_message(chat_id, "❌ Недостаточно средств на фьючерсном балансе (минимум $10).")
         return
@@ -1633,22 +1599,21 @@ async def execute_trade(chat_id, trade_info, ctx):
     risk_pct = trade_settings.get("risk_pct", AUTOTRADE_RISK_PCT.get(chat_id, 1.0))
     leverage = trade_settings.get("leverage", AUTOTRADE_LEVERAGE.get(chat_id, DEFAULT_LEVERAGE))
     risk_usdt = balance * risk_pct / 100
-    price_precision, qty_precision, min_qty = get_symbol_info(symbol)
+    price_precision, qty_precision, min_qty = get_symbol_info(symbol, chat_id=chat_id)
 
     atr_risk_price = abs(entry - sl)
     if atr_risk_price <= 0:
         await ctx.bot.send_message(chat_id, "❌ Ошибка расчёта риска (SL = цена входа).")
         return
 
-    # qty = сколько монет купить, чтобы при достижении SL потерять ровно risk_usdt
     qty = risk_usdt / atr_risk_price
     qty = max(round(qty, qty_precision), min_qty or 0.001)
 
-    set_leverage(symbol, leverage, keys["api_key"], keys["api_secret"])
+    set_leverage(symbol, leverage, keys["api_key"], keys["api_secret"], chat_id=chat_id)
 
     side = "BUY" if direction == "long" else "SELL"
     order = place_futures_market_order(symbol, side, qty, qty_precision,
-                                       keys["api_key"], keys["api_secret"])
+                                       keys["api_key"], keys["api_secret"], chat_id=chat_id)
 
     if not order or "orderId" not in order:
         err = (order or {}).get("msg", "нет ответа от биржи")
@@ -1662,7 +1627,7 @@ async def execute_trade(chat_id, trade_info, ctx):
     sl_res, tp_res = place_sl_tp_orders(
         symbol, direction, sl, tp1, qty,
         price_precision, qty_precision,
-        keys["api_key"], keys["api_secret"]
+        keys["api_key"], keys["api_secret"], chat_id=chat_id
     )
     sl_ok = sl_res and "orderId" in sl_res
     tp_ok = tp_res and "orderId" in tp_res
@@ -1682,7 +1647,7 @@ async def execute_trade(chat_id, trade_info, ctx):
 
     await ctx.bot.send_message(
         chat_id,
-        f"✅ *Позиция открыта!*\n\n"
+        f"✅ *Позиция открыта!* {mode_label}\n\n"
         f"{dir_label} *{symbol.replace('USDT', '')}*\n"
         f"💵 Вход: `{fmt_price(fill_price)}`\n"
         f"📦 Объём: `{qty}` (~`${notional:,.2f} USDT` маржи)\n"
@@ -1730,13 +1695,13 @@ async def autotrade_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if cmd == "status":
         enabled = AUTOTRADE_ENABLED.get(chat_id, False)
         risk = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
-        leverage = AUTOTRADE_LEVERAGE.get(chat_id, DEFAULT_LEVERAGE)
         open_trades = OPEN_AUTOTRADES.get(chat_id, [])
+        pending = sum(1 for t in PENDING_TRADES.values() if True)  # все pending
         lines = [
             f"📟 *Статус автоторговли*\n",
             f"Состояние: {'🟢 Включена' if enabled else '🔴 Выключена'}",
-            f"Риск на сделку: `{risk}%` (можно менять в карточке сигнала)",
-            f"Плечо по умолчанию: `x{leverage}` (можно менять в карточке сигнала)",
+            f"Риск на сделку: `{risk}%`",
+            f"Плечо: `x{DEFAULT_LEVERAGE}`",
             f"Порог сигнала: `≥ {AUTOTRADE_SCORE_THRESHOLD}` из ±15",
             f"Открытых авто-позиций: `{len(open_trades)}`",
         ]
@@ -1767,7 +1732,7 @@ async def autotrade_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
 
         keys = USER_KEYS[chat_id]
-        bal = get_futures_balance(keys["api_key"], keys["api_secret"])
+        bal = get_futures_balance(keys["api_key"], keys["api_secret"], chat_id=chat_id)
         if bal is None:
             await update.message.reply_text(
                 "❌ Не удалось получить фьючерсный баланс.\n"
@@ -1776,20 +1741,23 @@ async def autotrade_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        mode = USER_MODE.get(chat_id, "real")
+        mode_label = "🧪 DEMO (testnet)" if mode == "demo" else "💰 REAL (реальные деньги)"
+        leverage = AUTOTRADE_LEVERAGE.get(chat_id, DEFAULT_LEVERAGE)
         AUTOTRADE_ENABLED[chat_id] = True
         AUTOTRADE_RISK_PCT[chat_id] = risk
 
         await update.message.reply_text(
             f"✅ *Автоторговля включена*\n\n"
+            f"🌐 Режим: *{mode_label}*\n"
             f"💰 Баланс фьючерсов: `${bal:,.2f} USDT`\n"
             f"⚖️ Риск на сделку: `{risk}%` ≈ `${bal * risk / 100:,.2f} USDT`\n"
-            f"🔢 Плечо: `x{DEFAULT_LEVERAGE}`\n"
+            f"🔢 Плечо: `x{leverage}` (настраивается в карточке сигнала)\n"
             f"📊 Порог сигнала: score `≥ {AUTOTRADE_SCORE_THRESHOLD}` (из ±15)\n"
             f"🔄 Скан каждые 15 мин\n\n"
             f"При сильном сигнале бот пришлёт карточку с кнопками "
             f"✅ *Войти* / ❌ *Отмена*.\n\n"
-            f"⚠️ _Это реальные сделки на реальные деньги. "
-            f"Ты несёшь полную ответственность за результат._",
+            f"{'⚠️ _DEMO режим — реальных денег нет._' if mode == 'demo' else '⚠️ _Это реальные сделки на реальные деньги. Ты несёшь полную ответственность за результат._'}",
             parse_mode="Markdown"
         )
         return
@@ -1798,6 +1766,51 @@ async def autotrade_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "❓ Неизвестная команда.\nИспользуй: `/autotrade on/off/status`",
         parse_mode="Markdown"
     )
+
+
+async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/mode [demo|real] — переключить режим торговли между testnet и реальным Binance."""
+    chat_id = update.effective_chat.id
+    current = USER_MODE.get(chat_id, "real")
+
+    if not ctx.args:
+        label = "🧪 DEMO (testnet.binancefuture.com)" if current == "demo" else "💰 REAL (реальный Binance)"
+        await update.message.reply_text(
+            f"🌐 *Текущий режим:* {label}\n\n"
+            f"• `/mode demo` — переключить на демо (testnet, виртуальные деньги)\n"
+            f"• `/mode real` — переключить на реальный Binance\n\n"
+            f"⚠️ При смене режима нужно ввести `/setkey` с ключами для нового режима.\n"
+            f"Для демо ключи берутся на *testnet.binancefuture.com* (вход через GitHub).",
+            parse_mode="Markdown"
+        )
+        return
+
+    mode = ctx.args[0].lower()
+    if mode not in ("demo", "real"):
+        await update.message.reply_text("❌ Используй: `/mode demo` или `/mode real`", parse_mode="Markdown")
+        return
+
+    USER_MODE[chat_id] = mode
+    if mode == "demo":
+        await update.message.reply_text(
+            "🧪 *Режим DEMO включён*\n\n"
+            "Бот будет использовать *testnet.binancefuture.com*.\n\n"
+            "Как получить тестовые ключи:\n"
+            "1. Зайди на testnet.binancefuture.com\n"
+            "2. Войди через GitHub\n"
+            "3. Нажми *API Key* → *Generate HMAC\\_SHA256 Key*\n"
+            "4. Введи в боте: `/setkey API\\_KEY SECRET`\n\n"
+            "На балансе будет ~10,000 виртуальных USDT.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            "💰 *Режим REAL включён*\n\n"
+            "Бот будет использовать реальный *Binance Futures*.\n"
+            "Убедись что ввёл реальные API ключи через `/setkey`.\n\n"
+            "⚠️ _Все сделки будут на реальные деньги._",
+            parse_mode="Markdown"
+        )
 
 
 async def autoportfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1813,7 +1826,7 @@ async def autoportfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     keys = USER_KEYS[chat_id]
-    data = futures_signed_request("GET", "account", keys["api_key"], keys["api_secret"])
+    data = futures_signed_request("GET", "account", keys["api_key"], keys["api_secret"], chat_id=chat_id)
     live_pnl = {}
     if data and "positions" in data:
         for p in data["positions"]:
@@ -1837,47 +1850,6 @@ async def autoportfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pnl_total_str = f"+${total_pnl:,.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):,.2f}"
     lines.append(f"*Итого PnL:* `{pnl_total_str} USDT`")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-# ─── Автоторговля: карточка сигнала ──────────────────────────────────────────
-
-def build_trade_card_text(symbol, score, price, sl, tp1, tp2,
-                          risk_pct, leverage, risk_usdt, dir_label):
-    return (
-        f"🤖 *Авто-сигнал: {dir_label}*\n\n"
-        f"💎 *{symbol.replace('USDT', '')}*\n"
-        f"📊 Счёт: `{score:+.1f}` / ±15\n"
-        f"💵 Цена: `{fmt_price(price)}`\n"
-        f"🛑 SL: `{fmt_price(sl)}`\n"
-        f"🎯 TP1: `{fmt_price(tp1)}`\n"
-        f"🎯 TP2: `{fmt_price(tp2)}`\n\n"
-        f"⚖️ Плечо: `x{leverage}`\n"
-        f"💰 Риск: `{risk_pct}%` ≈ `~${risk_usdt:.2f} USDT`\n\n"
-        f"⏳ _Актуально ~15 минут_\n"
-        f"⚠️ _Реальная сделка на реальные деньги_"
-    )
-
-
-def build_trade_keyboard(trade_id, risk_pct, leverage, risk_usdt):
-    """Строит клавиатуру карточки сигнала с кнопками изменения плеча и риска."""
-    # Строка 1: изменение риска
-    risk_row = [
-        InlineKeyboardButton("💰 −0.5%", callback_data=f"trade_risk_down:{trade_id}"),
-        InlineKeyboardButton(f"Риск {risk_pct}% ≈ ${risk_usdt:.0f}", callback_data="noop"),
-        InlineKeyboardButton("💰 +0.5%", callback_data=f"trade_risk_up:{trade_id}"),
-    ]
-    # Строка 2: изменение плеча
-    lev_row = [
-        InlineKeyboardButton("⚖️ −1x", callback_data=f"trade_lev_down:{trade_id}"),
-        InlineKeyboardButton(f"Плечо x{leverage}", callback_data="noop"),
-        InlineKeyboardButton("⚖️ +1x", callback_data=f"trade_lev_up:{trade_id}"),
-    ]
-    # Строка 3: войти / отмена
-    action_row = [
-        InlineKeyboardButton(f"✅ Войти", callback_data=f"trade_confirm:{trade_id}"),
-        InlineKeyboardButton("❌ Отмена", callback_data=f"trade_cancel:{trade_id}"),
-    ]
-    return InlineKeyboardMarkup([risk_row, lev_row, action_row])
 
 
 # ─── Автоторговля: фоновый сканер ────────────────────────────────────────────
@@ -1929,23 +1901,37 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
             PENDING_TRADES[trade_id] = {
                 "symbol": symbol, "direction": direction,
                 "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2, "score": score,
-                "trade_id": trade_id,
             }
 
             keys = USER_KEYS[chat_id]
             bal = get_futures_balance(keys["api_key"], keys["api_secret"]) or 0
             risk_pct = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
-            leverage = AUTOTRADE_LEVERAGE.get(chat_id, DEFAULT_LEVERAGE)
-            PENDING_TRADE_SETTINGS[trade_id] = {"risk_pct": risk_pct, "leverage": leverage}
             risk_usdt = bal * risk_pct / 100
 
-            kb = build_trade_keyboard(trade_id, risk_pct, leverage, risk_usdt)
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"✅ Войти (~${risk_usdt:.0f} риск)",
+                    callback_data=f"trade_confirm:{trade_id}"
+                ),
+                InlineKeyboardButton("❌ Отмена", callback_data=f"trade_cancel:{trade_id}"),
+            ]])
 
             try:
                 await ctx.bot.send_message(
                     chat_id=chat_id,
-                    text=build_trade_card_text(symbol, score, price, sl, tp1, tp2,
-                                               risk_pct, leverage, risk_usdt, dir_label),
+                    text=(
+                        f"🤖 *Авто-сигнал: {dir_label}*\n\n"
+                        f"💎 *{symbol.replace('USDT', '')}*\n"
+                        f"📊 Счёт: `{score:+.1f}` / ±15\n"
+                        f"💵 Цена: `{fmt_price(price)}`\n"
+                        f"🛑 SL: `{fmt_price(sl)}`\n"
+                        f"🎯 TP1: `{fmt_price(tp1)}`\n"
+                        f"🎯 TP2: `{fmt_price(tp2)}`\n"
+                        f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n"
+                        f"💰 Риск: `~${risk_usdt:.2f} USDT` ({risk_pct}%)\n\n"
+                        f"⏳ _Актуально ~15 минут_\n"
+                        f"⚠️ _Реальная сделка на реальные деньги_"
+                    ),
                     parse_mode="Markdown",
                     reply_markup=kb
                 )
@@ -1982,6 +1968,7 @@ def main():
     app.add_handler(CommandHandler("info", info))
     app.add_handler(CommandHandler("autotrade", autotrade_cmd))
     app.add_handler(CommandHandler("autoportfolio", autoportfolio))
+    app.add_handler(CommandHandler("mode", mode_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_error_handler(global_error_handler)
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
