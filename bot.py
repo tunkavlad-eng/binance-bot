@@ -25,18 +25,16 @@ logger = logging.getLogger(__name__)
 
 BINANCE_API = "https://api.binance.com/api/v3"
 BINANCE_FUTURES_API = "https://fapi.binance.com/fapi/v1"
+USER_KEYS: dict[int, dict] = {}
 
 # ─── Режим торговли (demo / real) ─────────────────────────────────────────────
 REAL_FUTURES_API = "https://fapi.binance.com/fapi/v1"
-DEMO_FUTURES_API = "https://demo-fapi.binance.com/fapi/v1"
-DEMO_FUTURES_API_V2 = "https://demo-fapi.binance.com/fapi/v2"
-DEMO_FUTURES_API_V3 = "https://demo-fapi.binance.com/fapi/v3"
+DEMO_FUTURES_API = "https://testnet.binancefuture.com/fapi/v1"
+DEMO_FUTURES_API_V2 = "https://testnet.binancefuture.com/fapi/v2"
 USER_MODE: dict[int, str] = {}   # chat_id -> "real" | "demo"  (default: "real")
 
 def get_futures_api(chat_id: int) -> str:
     return DEMO_FUTURES_API if USER_MODE.get(chat_id) == "demo" else REAL_FUTURES_API
-
-USER_KEYS: dict[int, dict] = {}
 
 # Подписки на алерты: chat_id -> set(symbols), плюс отдельный флаг подписки на скан рынка
 ALERT_SUBSCRIPTIONS: dict[int, set] = {}
@@ -871,11 +869,14 @@ HELP_SECTIONS = {
     ),
     "account": (
         "🔑 *Личный аккаунт Binance*\n\n"
-        "• `/setkey API_KEY SECRET` — подключить ключи\n"
-        "• `/balance` — баланс спот-кошелька\n"
+        "• `/mode demo` / `/mode real` — выбрать режим: тестовая сеть (виртуальные деньги) или реальный Binance\n"
+        "• `/setkey API_KEY SECRET` — подключить ключи для текущего режима\n"
+        "• `/balance` — баланс спот-кошелька (только real)\n"
         "• `/positions` — открытые фьючерсные позиции и PnL\n"
-        "• `/deletekey` — удалить ключи\n\n"
-        "⚠️ _Создавай ключ только с правом Read Info. НИКОГДА не давай право "
+        "• `/deletekey` — удалить ключи\n"
+        "• `/autotrade on/off/status` — автоторговля по сильным сигналам (нужны ключи с правом Futures Trading)\n"
+        "• `/autoportfolio` — открытые авто-позиции и live PnL\n\n"
+        "⚠️ _Для real-режима создавай ключ только с нужными правами. НИКОГДА не давай право "
         "на вывод средств (Withdrawal). Используй `/setkey` только в личке "
         "с ботом, не в группах — ключи хранятся в памяти без шифрования._"
     ),
@@ -1053,39 +1054,32 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mode = USER_MODE.get(user_id, "real")
 
     if mode == "demo":
-        ok = False
-        last_response = None
-        for base in [DEMO_FUTURES_API_V3, DEMO_FUTURES_API_V2, DEMO_FUTURES_API]:
-            params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
-            query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-            signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
-            params["signature"] = signature
-            headers = {"X-MBX-APIKEY": api_key}
-            try:
-                r = requests.get(f"{base}/balance", params=params, headers=headers, timeout=10)
-                data = r.json()
-                last_response = f"{base}/balance → HTTP {r.status_code}: {str(data)[:200]}"
-                logger.info(f"setkey demo {base}/balance response: {data}")
-                if isinstance(data, list) or (data and "assets" in data):
-                    ok = True
-                    break
-            except Exception as e:
-                last_response = f"{base} → Exception: {e}"
-                logger.warning(f"setkey demo {base}: {e}")
+        # Testnet-ключи валидны только на testnet.binancefuture.com,
+        # проверяем через futures-баланс (V2), а не через спотовый /account.
+        params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
+        query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+        params["signature"] = signature
+        headers = {"X-MBX-APIKEY": api_key}
+        try:
+            r = requests.get(f"{DEMO_FUTURES_API_V2}/balance", params=params, headers=headers, timeout=10)
+            data = r.json()
+            ok = isinstance(data, list)
+        except Exception as e:
+            logger.warning(f"setkey demo check error: {e}")
+            ok = False
     else:
-        # Для реального — через спотовый API
+        # Для реального — через спотовый API, как раньше
         test = signed_request("GET", f"{BINANCE_API}/account", api_key, api_secret)
         ok = test is not None and "code" not in (test or {})
 
     if not ok:
-        mode_hint = "демо (demo-fapi.binance.com)" if mode == "demo" else "реального Binance"
-        debug = f"\n\n🔍 Ответ сервера:\n`{last_response}`" if mode == "demo" and last_response else ""
+        mode_hint = "демо (testnet.binancefuture.com)" if mode == "demo" else "реального Binance"
         await update.message.reply_text(
             f"❌ Неверные ключи или недостаточно прав.\n\n"
             f"Режим сейчас: *{'🧪 DEMO' if mode == 'demo' else '💰 REAL'}*\n"
             f"Убедись что ключи от {mode_hint}.\n\n"
-            f"Сменить режим: `/mode demo` или `/mode real`"
-            f"{debug}",
+            f"Сменить режим: `/mode demo` или `/mode real`",
             parse_mode="Markdown"
         )
         return
@@ -1152,7 +1146,7 @@ async def positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text("⏳ Получаю позиции...")
     keys = USER_KEYS[user_id]
-    data = signed_request("GET", f"{BINANCE_FUTURES_API}/account", keys["api_key"], keys["api_secret"])
+    data = futures_signed_request("GET", "account", keys["api_key"], keys["api_secret"], chat_id=user_id)
 
     if not data or "code" in data:
         await msg.edit_text("❌ Ошибка. Нужны права на Futures.", parse_mode="Markdown")
@@ -1553,27 +1547,21 @@ def get_futures_balance(api_key, api_secret, chat_id=None):
     mode = USER_MODE.get(chat_id, "real") if chat_id else "real"
 
     if mode == "demo":
-        # demo-fapi поддерживает /fapi/v3/balance (не /account)
-        for base in [DEMO_FUTURES_API_V3, DEMO_FUTURES_API_V2, DEMO_FUTURES_API]:
-            params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
-            query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-            signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
-            params["signature"] = signature
-            headers = {"X-MBX-APIKEY": api_key}
-            try:
-                r = requests.get(f"{base}/balance", params=params, headers=headers, timeout=10)
-                data = r.json()
-                logger.info(f"get_futures_balance demo {base}/balance: {str(data)[:150]}")
-                if isinstance(data, list):
-                    for asset in data:
-                        if asset.get("asset") == "USDT":
-                            return float(asset["availableBalance"])
-                elif data and "assets" in data:
-                    for asset in data["assets"]:
-                        if asset["asset"] == "USDT":
-                            return float(asset["availableBalance"])
-            except Exception as e:
-                logger.warning(f"get_futures_balance demo {base}: {e}")
+        # demo-fapi поддерживает /fapi/v2/balance (не /account)
+        params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
+        query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+        params["signature"] = signature
+        headers = {"X-MBX-APIKEY": api_key}
+        try:
+            r = requests.get(f"{DEMO_FUTURES_API_V2}/balance", params=params, headers=headers, timeout=10)
+            data = r.json()
+            if isinstance(data, list):
+                for asset in data:
+                    if asset.get("asset") == "USDT":
+                        return float(asset["availableBalance"])
+        except Exception as e:
+            logger.warning(f"get_futures_balance demo: {e}")
         return None
 
     data = futures_signed_request("GET", "account", api_key, api_secret, chat_id=chat_id)
@@ -1662,9 +1650,7 @@ async def execute_trade(chat_id, trade_info, ctx):
         await ctx.bot.send_message(chat_id, "❌ Недостаточно средств на фьючерсном балансе (минимум $10).")
         return
 
-    trade_settings = PENDING_TRADE_SETTINGS.pop(trade_info.get("trade_id", ""), {})
-    risk_pct = trade_settings.get("risk_pct", AUTOTRADE_RISK_PCT.get(chat_id, 1.0))
-    leverage = trade_settings.get("leverage", AUTOTRADE_LEVERAGE.get(chat_id, DEFAULT_LEVERAGE))
+    risk_pct = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
     risk_usdt = balance * risk_pct / 100
     price_precision, qty_precision, min_qty = get_symbol_info(symbol, chat_id=chat_id)
 
@@ -1673,10 +1659,11 @@ async def execute_trade(chat_id, trade_info, ctx):
         await ctx.bot.send_message(chat_id, "❌ Ошибка расчёта риска (SL = цена входа).")
         return
 
+    # qty = сколько монет купить, чтобы при достижении SL потерять ровно risk_usdt
     qty = risk_usdt / atr_risk_price
     qty = max(round(qty, qty_precision), min_qty or 0.001)
 
-    set_leverage(symbol, leverage, keys["api_key"], keys["api_secret"], chat_id=chat_id)
+    set_leverage(symbol, DEFAULT_LEVERAGE, keys["api_key"], keys["api_secret"], chat_id=chat_id)
 
     side = "BUY" if direction == "long" else "SELL"
     order = place_futures_market_order(symbol, side, qty, qty_precision,
@@ -1710,7 +1697,7 @@ async def execute_trade(chat_id, trade_info, ctx):
     })
 
     dir_label = "🟢 LONG" if direction == "long" else "🔴 SHORT"
-    notional = qty * fill_price / leverage
+    notional = qty * fill_price / DEFAULT_LEVERAGE
 
     await ctx.bot.send_message(
         chat_id,
@@ -1718,8 +1705,7 @@ async def execute_trade(chat_id, trade_info, ctx):
         f"{dir_label} *{symbol.replace('USDT', '')}*\n"
         f"💵 Вход: `{fmt_price(fill_price)}`\n"
         f"📦 Объём: `{qty}` (~`${notional:,.2f} USDT` маржи)\n"
-        f"⚖️ Плечо: `x{leverage}`\n"
-        f"💰 Риск: `{risk_pct}%` ≈ `~${risk_usdt:.2f} USDT`\n"
+        f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n"
         f"🛑 SL: `{fmt_price(sl)}` {'✅' if sl_ok else '⚠️ не выставлен!'}\n"
         f"🎯 TP: `{fmt_price(tp1)}` {'✅' if tp_ok else '⚠️ не выставлен!'}\n\n"
         f"Используй `/autoportfolio` для отслеживания.\n"
@@ -1810,7 +1796,6 @@ async def autotrade_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         mode = USER_MODE.get(chat_id, "real")
         mode_label = "🧪 DEMO (testnet)" if mode == "demo" else "💰 REAL (реальные деньги)"
-        leverage = AUTOTRADE_LEVERAGE.get(chat_id, DEFAULT_LEVERAGE)
         AUTOTRADE_ENABLED[chat_id] = True
         AUTOTRADE_RISK_PCT[chat_id] = risk
 
@@ -1819,12 +1804,13 @@ async def autotrade_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🌐 Режим: *{mode_label}*\n"
             f"💰 Баланс фьючерсов: `${bal:,.2f} USDT`\n"
             f"⚖️ Риск на сделку: `{risk}%` ≈ `${bal * risk / 100:,.2f} USDT`\n"
-            f"🔢 Плечо: `x{leverage}` (настраивается в карточке сигнала)\n"
+            f"🔢 Плечо: `x{DEFAULT_LEVERAGE}`\n"
             f"📊 Порог сигнала: score `≥ {AUTOTRADE_SCORE_THRESHOLD}` (из ±15)\n"
             f"🔄 Скан каждые 15 мин\n\n"
             f"При сильном сигнале бот пришлёт карточку с кнопками "
             f"✅ *Войти* / ❌ *Отмена*.\n\n"
-            f"{'⚠️ _DEMO режим — реальных денег нет._' if mode == 'demo' else '⚠️ _Это реальные сделки на реальные деньги. Ты несёшь полную ответственность за результат._'}",
+            f"⚠️ _Это реальные сделки на реальные деньги. "
+            f"Ты несёшь полную ответственность за результат._",
             parse_mode="Markdown"
         )
         return
@@ -1833,51 +1819,6 @@ async def autotrade_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "❓ Неизвестная команда.\nИспользуй: `/autotrade on/off/status`",
         parse_mode="Markdown"
     )
-
-
-async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/mode [demo|real] — переключить режим торговли между testnet и реальным Binance."""
-    chat_id = update.effective_chat.id
-    current = USER_MODE.get(chat_id, "real")
-
-    if not ctx.args:
-        label = "🧪 DEMO (testnet.binancefuture.com)" if current == "demo" else "💰 REAL (реальный Binance)"
-        await update.message.reply_text(
-            f"🌐 *Текущий режим:* {label}\n\n"
-            f"• `/mode demo` — переключить на демо (testnet, виртуальные деньги)\n"
-            f"• `/mode real` — переключить на реальный Binance\n\n"
-            f"⚠️ При смене режима нужно ввести `/setkey` с ключами для нового режима.\n"
-            f"Для демо ключи берутся на *testnet.binancefuture.com* (вход через GitHub).",
-            parse_mode="Markdown"
-        )
-        return
-
-    mode = ctx.args[0].lower()
-    if mode not in ("demo", "real"):
-        await update.message.reply_text("❌ Используй: `/mode demo` или `/mode real`", parse_mode="Markdown")
-        return
-
-    USER_MODE[chat_id] = mode
-    if mode == "demo":
-        await update.message.reply_text(
-            "🧪 *Режим DEMO включён*\n\n"
-            "Бот будет использовать *testnet.binancefuture.com*.\n\n"
-            "Как получить тестовые ключи:\n"
-            "1. Зайди на testnet.binancefuture.com\n"
-            "2. Войди через GitHub\n"
-            "3. Нажми *API Key* → *Generate HMAC\\_SHA256 Key*\n"
-            "4. Введи в боте: `/setkey API\\_KEY SECRET`\n\n"
-            "На балансе будет ~10,000 виртуальных USDT.",
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text(
-            "💰 *Режим REAL включён*\n\n"
-            "Бот будет использовать реальный *Binance Futures*.\n"
-            "Убедись что ввёл реальные API ключи через `/setkey`.\n\n"
-            "⚠️ _Все сделки будут на реальные деньги._",
-            parse_mode="Markdown"
-        )
 
 
 async def autoportfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1920,6 +1861,57 @@ async def autoportfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ─── Автоторговля: фоновый сканер ────────────────────────────────────────────
+
+async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/mode [demo|real] — переключить режим торговли между testnet и реальным Binance."""
+    chat_id = update.effective_chat.id
+    current = USER_MODE.get(chat_id, "real")
+
+    if not ctx.args:
+        label = "🧪 DEMO (testnet.binancefuture.com)" if current == "demo" else "💰 REAL (реальный Binance)"
+        await update.message.reply_text(
+            f"🌐 *Текущий режим:* {label}\n\n"
+            f"• `/mode demo` — переключить на демо (testnet, виртуальные деньги)\n"
+            f"• `/mode real` — переключить на реальный Binance\n\n"
+            f"⚠️ При смене режима нужно ввести `/setkey` с ключами для нового режима.\n"
+            f"Для демо ключи берутся на *testnet.binancefuture.com* (вход через GitHub).",
+            parse_mode="Markdown"
+        )
+        return
+
+    mode = ctx.args[0].lower()
+    if mode not in ("demo", "real"):
+        await update.message.reply_text("❌ Используй: `/mode demo` или `/mode real`", parse_mode="Markdown")
+        return
+
+    USER_MODE[chat_id] = mode
+    # Старый ключ почти наверняка не подходит для нового режима — убираем,
+    # чтобы не было ситуации "real-ключ тихо используется на demo-эндпоинте".
+    USER_KEYS.pop(chat_id, None)
+
+    if mode == "demo":
+        await update.message.reply_text(
+            "🧪 *Режим DEMO включён*\n\n"
+            "Бот будет использовать *testnet.binancefuture.com*.\n\n"
+            "Как получить тестовые ключи:\n"
+            "1. Зайди на testnet.binancefuture.com\n"
+            "2. Войди через GitHub\n"
+            "3. Нажми *API Key* → *Generate HMAC\\_SHA256 Key*\n"
+            "4. Введи в боте: `/setkey API\\_KEY SECRET`\n\n"
+            "На балансе будет ~10,000 виртуальных USDT.\n"
+            "Старый ключ (если был) удалён — нужно подключить новый.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            "💰 *Режим REAL включён*\n\n"
+            "Бот будет использовать реальный *Binance Futures*.\n"
+            "Введи реальные API ключи через `/setkey`.\n\n"
+            "⚠️ _Все сделки будут на реальные деньги._\n"
+            "Старый ключ (если был) удалён — нужно подключить новый.",
+            parse_mode="Markdown"
+        )
+
 
 async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
     """Каждые 15 мин ищет сигналы для пользователей с активной автоторговлей."""
@@ -1971,7 +1963,7 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
             }
 
             keys = USER_KEYS[chat_id]
-            bal = get_futures_balance(keys["api_key"], keys["api_secret"]) or 0
+            bal = get_futures_balance(keys["api_key"], keys["api_secret"], chat_id=chat_id) or 0
             risk_pct = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
             risk_usdt = bal * risk_pct / 100
 
