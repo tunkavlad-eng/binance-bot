@@ -1048,13 +1048,34 @@ async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     api_key, api_secret = ctx.args[0], ctx.args[1]
-    test = signed_request("GET", f"{BINANCE_API}/account", api_key, api_secret)
-    if test is None or "code" in (test or {}):
-        await update.message.reply_text("❌ Неверные ключи или недостаточно прав (нужен Read Info).", parse_mode="Markdown")
+    mode = USER_MODE.get(user_id, "real")
+
+    if mode == "demo":
+        # Для демо проверяем через фьючерсный демо-эндпоинт
+        test = futures_signed_request("GET", "account", api_key, api_secret, chat_id=user_id)
+        ok = test is not None and "assets" in (test or {})
+    else:
+        # Для реального — через спотовый API
+        test = signed_request("GET", f"{BINANCE_API}/account", api_key, api_secret)
+        ok = test is not None and "code" not in (test or {})
+
+    if not ok:
+        mode_hint = "демо (demo-fapi.binance.com)" if mode == "demo" else "реального Binance"
+        await update.message.reply_text(
+            f"❌ Неверные ключи или недостаточно прав.\n\n"
+            f"Режим сейчас: *{'🧪 DEMO' if mode == 'demo' else '💰 REAL'}*\n"
+            f"Убедись что ключи от {mode_hint}.\n\n"
+            f"Сменить режим: `/mode demo` или `/mode real`",
+            parse_mode="Markdown"
+        )
         return
 
     USER_KEYS[user_id] = {"api_key": api_key, "api_secret": api_secret}
-    await update.message.reply_text("✅ *API ключи подключены!*\nДоступны: `/balance`, `/positions`", parse_mode="Markdown")
+    mode_label = "🧪 DEMO" if mode == "demo" else "💰 REAL"
+    await update.message.reply_text(
+        f"✅ *API ключи подключены!* {mode_label}\nДоступны: `/balance`, `/positions`",
+        parse_mode="Markdown"
+    )
 
 
 async def deletekey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
