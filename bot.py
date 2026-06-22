@@ -1117,8 +1117,24 @@ async def balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Сначала: `/setkey API_KEY API_SECRET`", parse_mode="Markdown")
         return
 
-    msg = await update.message.reply_text("⏳ Получаю баланс...")
     keys = USER_KEYS[user_id]
+    mode = USER_MODE.get(user_id, "real")
+
+    if mode == "demo":
+        # Demo-ключ выпущен под фьючерсы (demo-fapi) — спотового баланса там нет,
+        # показываем фьючерсный баланс через тот же эндпоинт, что и /positions.
+        msg = await update.message.reply_text("⏳ Получаю фьючерсный баланс (DEMO)...")
+        bal = get_futures_balance(keys["api_key"], keys["api_secret"], chat_id=user_id)
+        if bal is None:
+            await msg.edit_text("❌ Ошибка. Проверь права API ключа (нужен Enable Futures).")
+            return
+        await msg.edit_text(
+            f"💼 *Фьючерсный баланс (DEMO)*\n\n💰 Доступно: `${bal:,.2f} USDT`",
+            parse_mode="Markdown"
+        )
+        return
+
+    msg = await update.message.reply_text("⏳ Получаю баланс...")
     data = signed_request("GET", f"{BINANCE_API}/account", keys["api_key"], keys["api_secret"])
 
     if not data or "code" in data:
@@ -1978,6 +1994,9 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
             risk_pct = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
             risk_usdt = bal * risk_pct / 100
 
+            mode = USER_MODE.get(chat_id, "real")
+            mode_label = "🧪 DEMO (виртуальные деньги)" if mode == "demo" else "💰 REAL (реальные деньги)"
+
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     f"✅ Войти (~${risk_usdt:.0f} риск)",
@@ -1990,7 +2009,7 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
                 await ctx.bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"🤖 *Авто-сигнал: {dir_label}*\n\n"
+                        f"🤖 *Авто-сигнал: {dir_label}* {mode_label}\n\n"
                         f"💎 *{symbol.replace('USDT', '')}*\n"
                         f"📊 Счёт: `{score:+.1f}` / ±15\n"
                         f"💵 Цена: `{fmt_price(price)}`\n"
@@ -1999,8 +2018,7 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
                         f"🎯 TP2: `{fmt_price(tp2)}`\n"
                         f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n"
                         f"💰 Риск: `~${risk_usdt:.2f} USDT` ({risk_pct}%)\n\n"
-                        f"⏳ _Актуально ~15 минут_\n"
-                        f"⚠️ _Реальная сделка на реальные деньги_"
+                        f"⏳ _Актуально ~15 минут_"
                     ),
                     parse_mode="Markdown",
                     reply_markup=kb
