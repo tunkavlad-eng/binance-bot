@@ -46,7 +46,7 @@ AUTOTRADE_ENABLED: dict[int, bool] = {}       # chat_id -> вкл/выкл
 AUTOTRADE_RISK_PCT: dict[int, float] = {}     # chat_id -> % баланса на сделку
 PENDING_TRADES: dict[str, dict] = {}          # trade_id -> данные сделки (до подтверждения)
 OPEN_AUTOTRADES: dict[int, list] = {}         # chat_id -> список открытых авто-позиций
-AUTOTRADE_SCORE_THRESHOLD = 6.0              # порог сигнала (чуть выше алертного)
+AUTOTRADE_SCORE_THRESHOLD = 5.0              # порог сигнала
 DEFAULT_LEVERAGE = 3                          # плечо по умолчанию
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -1833,7 +1833,7 @@ async def autotrade_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"⚖️ Риск на сделку: `{risk}%` ≈ `${bal * risk / 100:,.2f} USDT`\n"
             f"🔢 Плечо: `x{DEFAULT_LEVERAGE}`\n"
             f"📊 Порог сигнала: score `≥ {AUTOTRADE_SCORE_THRESHOLD}` (из ±15)\n"
-            f"🔄 Скан каждые 15 мин\n\n"
+            f"🔄 Скан каждые 10 мин\n\n"
             f"При сильном сигнале бот пришлёт карточку с кнопками "
             f"✅ *Войти* / ❌ *Отмена*.\n\n"
             f"⚠️ _Это реальные сделки на реальные деньги. "
@@ -1941,7 +1941,7 @@ async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
-    """Каждые 15 мин ищет сигналы для пользователей с активной автоторговлей."""
+    """Каждые 10 мин ищет сигналы для пользователей с активной автоторговлей."""
     import uuid
     active_users = [cid for cid, on in AUTOTRADE_ENABLED.items() if on]
     if not active_users:
@@ -2065,7 +2065,7 @@ def main():
     app.job_queue.run_repeating(alert_job, interval=600, first=30)
     app.job_queue.run_repeating(market_scan_job, interval=3600, first=60)
     # Автоторговля: скан каждые 15 минут
-    app.job_queue.run_repeating(autotrade_scan_job, interval=900, first=90)
+    app.job_queue.run_repeating(autotrade_scan_job, interval=600, first=90)
 
     logger.info("Бот запущен...")
     app.run_polling()
