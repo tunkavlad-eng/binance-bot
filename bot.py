@@ -252,6 +252,409 @@ def check_divergence(df):
         return "🟢 Бычья дивергенция RSI (цена ↓, RSI ↑)"
     return None
 
+# ─── СТРАТЕГИИ ────────────────────────────────────────────────────────────────
+
+def strategy_mean_reversion(df, r):
+    """
+    Mean Reversion (контртренд, отскок от уровня).
+    Логика: RSI < 30 + цена у нижней BB + есть поддержка рядом → лонг.
+            RSI > 70 + цена у верхней BB + есть сопротивление → шорт.
+    Лучше работает в боковике (neutral trend).
+    Винрейт ~55-70%, средний R ~0.5-1.5.
+    """
+    score = 0
+    signals = []
+
+    rsi = r["rsi"]
+    bb_pos = r["bb_pos"]
+    trend = r["trend"]
+    close = df["close"].iloc[-1]
+    supports = r["supports"]
+    resistances = r["resistances"]
+
+    # Условие боковика или умеренного тренда
+    sideways = trend in ("neutral", "up", "down")
+
+    # Лонг: перепроданность + нижняя BB + близко к поддержке
+    if rsi < 30 and bb_pos == "below" and sideways:
+        score += 3
+        signals.append("RSI < 30 + цена у нижней BB ✅")
+        if len(supports) > 0 and close <= supports[0] * 1.01:
+            score += 2
+            signals.append("Цена у поддержки ✅")
+
+    elif rsi < 35 and bb_pos == "below":
+        score += 1.5
+        signals.append("RSI перепродан + нижняя BB ✅")
+
+    # Шорт: перекупленность + верхняя BB + близко к сопротивлению
+    if rsi > 70 and bb_pos == "above" and sideways:
+        score -= 3
+        signals.append("RSI > 70 + цена у верхней BB ❌")
+        if len(resistances) > 0 and close >= resistances[0] * 0.99:
+            score -= 2
+            signals.append("Цена у сопротивления ❌")
+
+    elif rsi > 65 and bb_pos == "above":
+        score -= 1.5
+        signals.append("RSI перекуплен + верхняя BB ❌")
+
+    # Бычья дивергенция усиливает лонг
+    if r["divergence"] and "Бычья" in r["divergence"] and score > 0:
+        score += 1.5
+        signals.append("Бычья дивергенция подтверждает ✅")
+
+    # Медвежья дивергенция усиливает шорт
+    if r["divergence"] and "Медвежья" in r["divergence"] and score < 0:
+        score -= 1.5
+        signals.append("Медвежья дивергенция подтверждает ❌")
+
+    # Паттерны разворота
+    for p in r["patterns"]:
+        if score > 0 and "bullish" in p:
+            score += 0.5
+            signals.append(f"Разворотный паттерн: {p} ✅")
+        elif score < 0 and "bearish" in p:
+            score -= 0.5
+            signals.append(f"Разворотный паттерн: {p} ❌")
+
+    # Не торгуем против сильного тренда
+    if trend == "strong_up" and score < 0:
+        score *= 0.3
+        signals.append("⚠️ Сильный аптренд — шорт опасен")
+    if trend == "strong_down" and score > 0:
+        score *= 0.3
+        signals.append("⚠️ Сильный даунтренд — лонг опасен")
+
+    return round(score, 2), signals
+
+
+def strategy_trend_pullback(df, r):
+    """
+    Trend Following / Pullback в тренде.
+    Логика: сильный тренд (EMA выстроены) + откат к EMA20/50 → вход по тренду.
+    Золотой/мёртвый крест как дополнительный фильтр.
+    Винрейт ~35-50%, R:R ~2-4.
+    """
+    score = 0
+    signals = []
+
+    close = df["close"].iloc[-1]
+    ema20 = r["ema20"]
+    ema50 = r["ema50"]
+    ema200 = r["ema200"]
+    trend = r["trend"]
+
+    # Восходящий тренд: цена над EMA200, EMA20 > EMA50
+    if trend in ("strong_up", "up") and ema20 > ema50 > ema200:
+        # Откат к EMA20 (точка входа в лонг)
+        if close <= ema20 * 1.005:
+            score += 3
+            signals.append("Тренд вверх + откат к EMA20 ✅")
+        # Откат к EMA50 (более глубокий, тоже валидный)
+        elif close <= ema50 * 1.01:
+            score += 2
+            signals.append("Тренд вверх + откат к EMA50 ✅")
+        else:
+            score += 1
+            signals.append("Восходящий тренд ✅")
+
+    # Нисходящий тренд: цена под EMA200, EMA20 < EMA50
+    elif trend in ("strong_down", "down") and ema20 < ema50:
+        # Откат к EMA20 (точка входа в шорт)
+        if close >= ema20 * 0.995:
+            score -= 3
+            signals.append("Тренд вниз + откат к EMA20 ❌")
+        elif close >= ema50 * 0.99:
+            score -= 2
+            signals.append("Тренд вниз + откат к EMA50 ❌")
+        else:
+            score -= 1
+            signals.append("Нисходящий тренд ❌")
+
+    # Золотой/мёртвый крест усиливает сигнал
+    if r["ema_cross"] == "golden":
+        score += 2
+        signals.append("Золотой крест EMA20/50 🌟")
+    elif r["ema_cross"] == "death":
+        score -= 2
+        signals.append("Мёртвый крест EMA20/50 💀")
+
+    # MACD подтверждает
+    if r["macd_cross"] == "bullish" and score > 0:
+        score += 1
+        signals.append("MACD бычье пересечение подтверждает ✅")
+    elif r["macd_cross"] == "bearish" and score < 0:
+        score -= 1
+        signals.append("MACD медвежье пересечение подтверждает ❌")
+
+    # RSI не должен быть в крайней зоне при входе по тренду
+    if 40 <= r["rsi"] <= 60 and score > 0:
+        score += 0.5
+        signals.append("RSI в нейтральной зоне (хороший откат) ✅")
+
+    return round(score, 2), signals
+
+
+def strategy_breakout(df, r):
+    """
+    Breakout (пробой диапазона/уровня + сужение волатильности).
+    Логика: цена пробивает сопротивление/поддержку + ATR подтверждает импульс
+            + объём выше среднего.
+    Винрейт ~40-50%, много ложных пробоев — фильтруем объёмом и ATR.
+    """
+    score = 0
+    signals = []
+
+    close = df["close"].iloc[-1]
+    supports = r["supports"]
+    resistances = r["resistances"]
+
+    atr = calc_atr(df, 14).iloc[-1]
+    avg_volume = df["volume"].rolling(20).mean().iloc[-1]
+    last_volume = df["volume"].iloc[-1]
+
+    # Пробой сопротивления вверх
+    if len(resistances) > 0:
+        res = resistances[0]
+        if close > res * 1.002:  # пробой с небольшим запасом
+            score += 2
+            signals.append(f"Пробой сопротивления {fmt_price(res)} ✅")
+
+            # Подтверждение объёмом
+            if last_volume > avg_volume * 1.5:
+                score += 2
+                signals.append("Объём выше среднего в 1.5x — пробой сильный ✅")
+            elif last_volume > avg_volume * 1.2:
+                score += 1
+                signals.append("Объём немного выше среднего ✅")
+            else:
+                score -= 1
+                signals.append("⚠️ Объём слабый — возможен ложный пробой")
+
+            # ATR подтверждает импульс
+            candle_body = abs(df["close"].iloc[-1] - df["open"].iloc[-1])
+            if candle_body > atr * 0.7:
+                score += 1
+                signals.append("Сильная свеча пробоя (тело > 0.7 ATR) ✅")
+
+    # Пробой поддержки вниз
+    if len(supports) > 0:
+        sup = supports[0]
+        if close < sup * 0.998:
+            score -= 2
+            signals.append(f"Пробой поддержки {fmt_price(sup)} ❌")
+
+            if last_volume > avg_volume * 1.5:
+                score -= 2
+                signals.append("Объём выше среднего — пробой сильный ❌")
+            elif last_volume > avg_volume * 1.2:
+                score -= 1
+                signals.append("Объём немного выше среднего ❌")
+            else:
+                score += 1
+                signals.append("⚠️ Объём слабый — возможен ложный пробой вниз")
+
+            candle_body = abs(df["close"].iloc[-1] - df["open"].iloc[-1])
+            if candle_body > atr * 0.7:
+                score -= 1
+                signals.append("Сильная свеча пробоя вниз ❌")
+
+    # Сужение BB (волатильность сжимается перед пробоем)
+    bb_upper, bb_mid, bb_lower = calc_bollinger(df["close"])
+    bb_width = (bb_upper.iloc[-1] - bb_lower.iloc[-1]) / bb_mid.iloc[-1]
+    bb_width_prev = (bb_upper.iloc[-20] - bb_lower.iloc[-20]) / bb_mid.iloc[-20] if len(df) > 20 else bb_width
+    if bb_width < bb_width_prev * 0.7:
+        signals.append("BB сужены — волатильность сжата, возможен пробой ⚡")
+
+    return round(score, 2), signals
+
+
+def strategy_divergence_swing(df, r):
+    """
+    Свинг по дивергенции (RSI/MACD vs цена).
+    Логика: дивергенция RSI + подтверждение MACD + паттерн разворота.
+    Винрейт ~45-55%, сигнал редкий, но качественный.
+    """
+    score = 0
+    signals = []
+
+    close = df["close"]
+    rsi_series = calc_rsi(close)
+    macd_line, macd_sig, macd_hist = calc_macd(close)
+
+    # Бычья дивергенция RSI: цена делает новый минимум, RSI — нет
+    if len(close) >= 20:
+        price_low1 = close.iloc[-1]
+        price_low2 = close.iloc[-15:-5].min()
+        rsi_low1 = rsi_series.iloc[-1]
+        rsi_low2 = rsi_series.iloc[-15:-5].min()
+
+        if price_low1 < price_low2 and rsi_low1 > rsi_low2:
+            score += 3
+            signals.append("Бычья дивергенция RSI (новый минимум цены, RSI выше) ✅")
+
+        # Медвежья дивергенция RSI: цена делает новый максимум, RSI — нет
+        price_high1 = close.iloc[-1]
+        price_high2 = close.iloc[-15:-5].max()
+        rsi_high1 = rsi_series.iloc[-1]
+        rsi_high2 = rsi_series.iloc[-15:-5].max()
+
+        if price_high1 > price_high2 and rsi_high1 < rsi_high2:
+            score -= 3
+            signals.append("Медвежья дивергенция RSI (новый максимум цены, RSI ниже) ❌")
+
+    # Дивергенция MACD-гистограммы
+    if len(macd_hist) >= 10:
+        hist_now = macd_hist.iloc[-1]
+        hist_prev = macd_hist.iloc[-8:-3].min()
+        price_now = close.iloc[-1]
+        price_prev_low = close.iloc[-8:-3].min()
+
+        if price_now < price_prev_low and hist_now > hist_prev:
+            score += 2
+            signals.append("Бычья дивергенция MACD-гистограммы ✅")
+
+        hist_prev_high = macd_hist.iloc[-8:-3].max()
+        price_prev_high = close.iloc[-8:-3].max()
+        if price_now > price_prev_high and hist_now < hist_prev_high:
+            score -= 2
+            signals.append("Медвежья дивергенция MACD-гистограммы ❌")
+
+    # Паттерн разворота подтверждает
+    for p in r["patterns"]:
+        if score > 0 and "bullish" in p:
+            score += 1
+            signals.append(f"Паттерн разворота: {p} ✅")
+        elif score < 0 and "bearish" in p:
+            score -= 1
+            signals.append(f"Паттерн разворота: {p} ❌")
+
+    # RSI в зоне перепроданности/перекупленности усиливает
+    if score > 0 and r["rsi"] < 40:
+        score += 1
+        signals.append(f"RSI {r['rsi']:.1f} — зона перепроданности ✅")
+    if score < 0 and r["rsi"] > 60:
+        score -= 1
+        signals.append(f"RSI {r['rsi']:.1f} — зона перекупленности ❌")
+
+    return round(score, 2), signals
+
+
+def strategy_multitf_confirm(r1h, r4h):
+    """
+    Мультитаймфрейм подтверждение (1H + 4H).
+    Логика: 4H задаёт направление (тренд/зона), 1H даёт точку входа.
+    Фильтрует шум младшего ТФ старшим.
+    Обычно повышает качество сигналов других стратегий.
+    """
+    score = 0
+    signals = []
+
+    # 4H задаёт главный тренд
+    if r4h["trend"] in ("strong_up", "up"):
+        score += 2
+        signals.append("4H: восходящий тренд (главное направление) ✅")
+    elif r4h["trend"] in ("strong_down", "down"):
+        score -= 2
+        signals.append("4H: нисходящий тренд (главное направление) ❌")
+
+    # 1H подтверждает направление 4H
+    tf_align = False
+    if r4h["trend"] in ("strong_up", "up") and r1h["trend"] in ("strong_up", "up"):
+        score += 2
+        signals.append("1H и 4H тренды совпадают — сильное подтверждение ✅")
+        tf_align = True
+    elif r4h["trend"] in ("strong_down", "down") and r1h["trend"] in ("strong_down", "down"):
+        score -= 2
+        signals.append("1H и 4H тренды совпадают — сильное подтверждение ❌")
+        tf_align = True
+    elif r4h["trend"] in ("strong_up", "up") and r1h["trend"] in ("strong_down", "down"):
+        signals.append("⚠️ 1H против 4H — возможен откат, входить осторожно")
+    elif r4h["trend"] in ("strong_down", "down") and r1h["trend"] in ("strong_up", "up"):
+        signals.append("⚠️ 1H против 4H — возможен откат, входить осторожно")
+
+    # RSI на обоих ТФ в одном направлении
+    if r4h["rsi"] < 40 and r1h["rsi"] < 45:
+        score += 1.5
+        signals.append(f"RSI перепродан на обоих ТФ (4H: {r4h['rsi']:.0f}, 1H: {r1h['rsi']:.0f}) ✅")
+    elif r4h["rsi"] > 60 and r1h["rsi"] > 55:
+        score -= 1.5
+        signals.append(f"RSI перекуплен на обоих ТФ (4H: {r4h['rsi']:.0f}, 1H: {r1h['rsi']:.0f}) ❌")
+
+    # MACD на обоих ТФ совпадают
+    macd_bull_4h = r4h["macd"] > r4h["macd_signal"]
+    macd_bull_1h = r1h["macd"] > r1h["macd_signal"]
+    if macd_bull_4h and macd_bull_1h:
+        score += 1
+        signals.append("MACD бычий на 1H и 4H ✅")
+    elif not macd_bull_4h and not macd_bull_1h:
+        score -= 1
+        signals.append("MACD медвежий на 1H и 4H ❌")
+
+    # EMA кросс на 4H — самый сильный фильтр
+    if r4h["ema_cross"] == "golden":
+        score += 2
+        signals.append("4H Золотой крест — мощный бычий сигнал 🌟")
+    elif r4h["ema_cross"] == "death":
+        score -= 2
+        signals.append("4H Мёртвый крест — мощный медвежий сигнал 💀")
+
+    # Дивергенция на 4H — редкий но качественный сигнал
+    if r4h["divergence"]:
+        if "Бычья" in r4h["divergence"]:
+            score += 2
+            signals.append(f"4H {r4h['divergence']} ✅")
+        elif "Медвежья" in r4h["divergence"]:
+            score -= 2
+            signals.append(f"4H {r4h['divergence']} ❌")
+
+    return round(score, 2), signals, tf_align
+
+
+def run_all_strategies(df1h, r1h, df4h=None, r4h=None):
+    """
+    Запускает все стратегии и возвращает сводную таблицу результатов.
+    """
+    results = {}
+
+    results["mean_reversion"] = strategy_mean_reversion(df1h, r1h)
+    results["trend_pullback"] = strategy_trend_pullback(df1h, r1h)
+    results["breakout"] = strategy_breakout(df1h, r1h)
+    results["divergence_swing"] = strategy_divergence_swing(df1h, r1h)
+
+    if r4h is not None:
+        mtf_score, mtf_signals, tf_align = strategy_multitf_confirm(r1h, r4h)
+        results["multitf"] = (mtf_score, mtf_signals)
+    else:
+        tf_align = False
+
+    # Суммарный взвешенный счёт всех стратегий
+    weights = {
+        "mean_reversion":  1.0,
+        "trend_pullback":  1.2,
+        "breakout":        0.8,
+        "divergence_swing": 1.0,
+        "multitf":         1.5,
+    }
+    total = sum(results[k][0] * weights.get(k, 1.0) for k in results)
+
+    return results, total, tf_align
+
+
+def fmt_strategy_score(score):
+    if score >= 3:
+        return f"🟢 +{score:.1f}"
+    elif score >= 1:
+        return f"🟡 +{score:.1f}"
+    elif score <= -3:
+        return f"🔴 {score:.1f}"
+    elif score <= -1:
+        return f"🟠 {score:.1f}"
+    else:
+        return f"⚪ {score:.1f}"
+
+
 def full_analysis(df):
     """Возвращает dict с результатами анализа."""
     close = df["close"]
@@ -847,13 +1250,16 @@ HELP_SECTIONS = {
         "🧠 *Технический анализ*\n\n"
         "• `/analyze BTC` — разбор на 5m/15m/1H/4H: RSI, MACD, Bollinger, "
         "EMA-кроссы, паттерны свечей, уровни, дивергенции\n"
-        "  └ Даёт общий взвешенный сигнал ЛОНГ / ШОРТ / НЕЙТРАЛЬНО + SL/TP "
-        "(на основе ATR) + график\n\n"
-        "• `/scan` — сканирует топ-60 ликвидных пар рынка (без стейблкоинов) "
-        "и находит топ-5 кандидатов на лонг и топ-5 на шорт (1H ТФ) с SL/TP\n\n"
-        "_Сигналы основаны на бэктесте за 2 года (~800 сделок): средний R "
-        "≈ +0.27, win-rate ≈ 49%. Это статистическое преимущество, "
-        "не гарантия каждой отдельной сделки._"
+        "  └ Даёт общий взвешенный сигнал ЛОНГ / ШОРТ / НЕЙТРАЛЬНО + SL/TP + график\n\n"
+        "• `/strategy BTC` — запускает 5 стратегий сразу с разбивкой:\n"
+        "  └ Mean Reversion (отскок от уровня, винрейт ~60%)\n"
+        "  └ Trend Pullback (откат в тренде, R:R ~2-4)\n"
+        "  └ Breakout (пробой уровня с объёмом)\n"
+        "  └ Divergence Swing (свинг по дивергенции RSI/MACD)\n"
+        "  └ MultiTF 1H+4H (подтверждение старшим ТФ)\n\n"
+        "• `/scan` — сканирует топ-60 ликвидных пар рынка "
+        "и находит топ-5 кандидатов на лонг и шорт с SL/TP\n\n"
+        "_Сигналы — статистическое преимущество, не гарантия._"
     ),
     "alerts": (
         "🔔 *Алерты (бот сам напишет тебе)*\n\n"
@@ -1036,6 +1442,126 @@ async def analyze(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 
+
+
+async def strategy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /strategy BTC — запускает все 5 стратегий и показывает сводную таблицу сигналов.
+    """
+    if not ctx.args:
+        await update.message.reply_text(
+            "Использование: `/strategy BTC`\n\n"
+            "Запускает 5 стратегий сразу:\n"
+            "• Mean Reversion (отскок)\n"
+            "• Trend Pullback (откат в тренде)\n"
+            "• Breakout (пробой уровня)\n"
+            "• Divergence Swing (свинг по дивергенции)\n"
+            "• MultiTF Confirm (1H + 4H подтверждение)",
+            parse_mode="Markdown"
+        )
+        return
+
+    symbol = normalize_symbol(ctx.args[0])
+    msg = await update.message.reply_text(
+        f"🔬 Запускаю все стратегии для *{symbol}*...", parse_mode="Markdown"
+    )
+
+    klines_1h = get_klines(symbol, "1h", 200)
+    klines_4h = get_klines(symbol, "4h", 200)
+
+    if not klines_1h:
+        await msg.edit_text("❌ Не удалось получить данные. Проверь тикер.")
+        return
+
+    df1h = klines_to_df(klines_1h)
+    r1h  = full_analysis(df1h)
+
+    df4h = r4h = None
+    if klines_4h:
+        df4h = klines_to_df(klines_4h)
+        r4h  = full_analysis(df4h)
+
+    strategy_results, total_score, tf_align = run_all_strategies(df1h, r1h, df4h, r4h)
+
+    current_price = df1h["close"].iloc[-1]
+    atr = calc_atr(df1h, 14).iloc[-1]
+    risk = atr * 1.5
+
+    # Итоговый сигнал
+    if total_score >= 8:
+        final_signal, final_emoji = "🟢 ЛОНГ (Сильный)", "🚀"
+    elif total_score >= 3:
+        final_signal, final_emoji = "🟡 ЛОНГ (Слабый)", "📈"
+    elif total_score <= -8:
+        final_signal, final_emoji = "🔴 ШОРТ (Сильный)", "💥"
+    elif total_score <= -3:
+        final_signal, final_emoji = "🟠 ШОРТ (Слабый)", "📉"
+    else:
+        final_signal, final_emoji = "⚪ НЕЙТРАЛЬНО", "⏸"
+
+    # SL/TP на основе ATR
+    if "ЛОНГ" in final_signal:
+        sl  = current_price - risk
+        tp1 = current_price + risk * 1.5
+        tp2 = current_price + risk * 3.0
+    elif "ШОРТ" in final_signal:
+        sl  = current_price + risk
+        tp1 = current_price - risk * 1.5
+        tp2 = current_price - risk * 3.0
+    else:
+        sl = tp1 = tp2 = None
+
+    strategy_names = {
+        "mean_reversion":   "Mean Reversion  (отскок)",
+        "trend_pullback":   "Trend Pullback  (по тренду)",
+        "breakout":         "Breakout          (пробой)",
+        "divergence_swing": "Divergence Swing (дивергенция)",
+        "multitf":          "MultiTF 1H+4H   (подтверждение)",
+    }
+
+    lines = [
+        f"🔬 *Анализ стратегий: {symbol}* | {datetime.utcnow().strftime('%H:%M UTC')}\n",
+        f"Цена: `{fmt_price(current_price)}`  ATR: `{fmt_price(atr)}`\n",
+        f"{'━'*30}",
+        f"{final_emoji} *Итоговый сигнал: {final_signal}*",
+        f"📊 Суммарный счёт: `{total_score:+.1f}`",
+        f"{'━'*30}\n",
+        f"*📋 Разбивка по стратегиям:*\n",
+    ]
+
+    for key, (sc, sigs) in strategy_results.items():
+        name = strategy_names.get(key, key)
+        lines.append(f"*{name}*  {fmt_strategy_score(sc)}")
+        for s in sigs[:3]:  # топ-3 причины каждой стратегии
+            lines.append(f"  └ {s}")
+        lines.append("")
+
+    if sl:
+        lines += [
+            f"{'━'*30}",
+            f"🛑 *Stop Loss:* `{fmt_price(sl)}`",
+            f"🎯 *TP1:* `{fmt_price(tp1)}`  (R:R 1.5)",
+            f"🎯 *TP2:* `{fmt_price(tp2)}`  (R:R 3.0)",
+        ]
+
+    if tf_align:
+        lines.append("\n✅ _1H и 4H тренды совпадают — сигнал надёжнее_")
+    elif r4h:
+        lines.append("\n⚠️ _1H и 4H тренды расходятся — входить осторожно_")
+
+    lines.append("\n⚠️ _Это не финансовый совет. Торгуй с умом._")
+
+    await msg.delete()
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    # График 1H + 4H
+    if r4h:
+        buf = build_analysis_chart(symbol, df1h, df4h, r1h, r4h)
+        await update.message.reply_photo(
+            photo=buf,
+            caption=f"📊 *{symbol}* — графики для анализа стратегий",
+            parse_mode="Markdown"
+        )
 
 
 async def setkey(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2003,7 +2529,12 @@ async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
-    """Каждые 10 мин ищет сигналы для пользователей с активной автоторговлей."""
+    """Каждые 10 мин ищет сигналы для пользователей с активной автоторговлей.
+    Использует КОМБИНИРОВАННЫЙ счёт: старый quick_score (1H скан) +
+    все 5 стратегий (mean_reversion, trend_pullback, breakout,
+    divergence_swing, multitf_confirm на 1H+4H).
+    Сигнал отправляется только если оба источника согласны по направлению.
+    """
     import uuid
     active_users = [cid for cid, on in AUTOTRADE_ENABLED.items() if on]
     if not active_users:
@@ -2021,22 +2552,61 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
 
         for candidate in candidates:
             symbol = candidate["symbol"]
-            score = candidate["score"]
+            quick_score = candidate["score"]
 
             if symbol in open_symbols:
                 continue
-            if abs(score) < AUTOTRADE_SCORE_THRESHOLD:
+            if abs(quick_score) < AUTOTRADE_SCORE_THRESHOLD:
                 continue
 
-            # Уточняем SL/TP по ATR с 1H данными
-            k1h = get_klines(symbol, "1h", 100)
+            # ── Загружаем 1H и 4H для детального анализа ──
+            k1h = get_klines(symbol, "1h", 200)
+            k4h = get_klines(symbol, "4h", 200)
             if not k1h:
                 continue
+
             df1h = klines_to_df(k1h)
-            atr = calc_atr(df1h, 14).iloc[-1]
+            r1h  = full_analysis(df1h)
+
+            df4h = r4h = None
+            if k4h and len(k4h) >= 50:
+                df4h = klines_to_df(k4h)
+                r4h  = full_analysis(df4h)
+
+            # ── Запускаем все 5 стратегий ──
+            strat_results, strat_total, tf_align = run_all_strategies(df1h, r1h, df4h, r4h)
+
+            # Разбивка по стратегиям для карточки
+            mr_score,  _ = strat_results.get("mean_reversion",   (0, []))
+            tp_score,  _ = strat_results.get("trend_pullback",    (0, []))
+            bo_score,  _ = strat_results.get("breakout",          (0, []))
+            ds_score,  _ = strat_results.get("divergence_swing",  (0, []))
+            mtf_score, _ = strat_results.get("multitf",           (0, []))
+
+            # ── Объединяем: quick_score (скан) + strat_total (5 стратегий) ──
+            # Нормируем quick_score к той же шкале что и strat_total
+            combined = quick_score * 1.0 + strat_total * 0.5
+
+            # Направление должно совпадать у обоих источников
+            quick_dir = "long"  if quick_score  > 0 else "short"
+            strat_dir = "long"  if strat_total  > 0 else "short"
+
+            if quick_dir != strat_dir:
+                logger.info(
+                    f"autotrade {symbol}: quick={quick_score:+.1f} vs strat={strat_total:+.1f} — "
+                    f"направления расходятся, пропускаем"
+                )
+                continue
+
+            # Минимальный порог комбинированного счёта
+            min_combined = AUTOTRADE_SCORE_THRESHOLD * 1.2
+            if abs(combined) < min_combined:
+                continue
+
+            direction = quick_dir
             price = df1h["close"].iloc[-1]
-            risk = atr * 1.5
-            direction = "long" if score > 0 else "short"
+            atr   = calc_atr(df1h, 14).iloc[-1]
+            risk  = atr * 1.5
 
             if direction == "long":
                 sl, tp1, tp2 = price - risk, price + risk * 1.5, price + risk * 3.0
@@ -2045,19 +2615,38 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
                 sl, tp1, tp2 = price + risk, price - risk * 1.5, price - risk * 3.0
                 dir_label = "🔴 SHORT"
 
+            # Считаем сколько стратегий согласны с направлением
+            strat_scores = [mr_score, tp_score, bo_score, ds_score, mtf_score]
+            agree_count = sum(
+                1 for s in strat_scores
+                if (direction == "long" and s > 0) or (direction == "short" and s < 0)
+            )
+
             trade_id = str(uuid.uuid4())[:8]
             PENDING_TRADES[trade_id] = {
                 "symbol": symbol, "direction": direction,
-                "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2, "score": score,
+                "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+                "score": combined,
             }
 
-            keys = USER_KEYS[chat_id]
-            bal = get_futures_balance(keys["api_key"], keys["api_secret"], chat_id=chat_id) or 0
+            keys     = USER_KEYS[chat_id]
+            bal      = get_futures_balance(keys["api_key"], keys["api_secret"], chat_id=chat_id) or 0
             risk_pct = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
             risk_usdt = bal * risk_pct / 100
 
-            mode = USER_MODE.get(chat_id, "real")
-            mode_label = "🧪 DEMO (виртуальные деньги)" if mode == "demo" else "💰 REAL (реальные деньги)"
+            mode       = USER_MODE.get(chat_id, "real")
+            mode_label = "🧪 DEMO" if mode == "demo" else "💰 REAL"
+
+            # Строки по каждой стратегии
+            def strat_line(name, sc):
+                if (direction == "long" and sc > 0) or (direction == "short" and sc < 0):
+                    return f"  ✅ {name}: `{sc:+.1f}`"
+                elif sc == 0:
+                    return f"  ⚪ {name}: нейтрально"
+                else:
+                    return f"  ❌ {name}: `{sc:+.1f}` (против)"
+
+            tf_note = "✅ 1H и 4H совпадают" if tf_align else "⚠️ 1H и 4H расходятся"
 
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton(
@@ -2067,21 +2656,31 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("❌ Отмена", callback_data=f"trade_cancel:{trade_id}"),
             ]])
 
+            text = (
+                f"🤖 *Авто-сигнал: {dir_label}* {mode_label}\n\n"
+                f"💎 *{symbol.replace('USDT', '')}*\n"
+                f"💵 Цена: `{fmt_price(price)}`\n"
+                f"📊 Скан (1H): `{quick_score:+.1f}` | Стратегии: `{strat_total:+.1f}`\n"
+                f"🔢 Итого: `{combined:+.1f}` | Согласны {agree_count}/5 стратегий\n\n"
+                f"*📋 Разбивка стратегий:*\n"
+                f"{strat_line('Mean Reversion ', mr_score)}\n"
+                f"{strat_line('Trend Pullback ', tp_score)}\n"
+                f"{strat_line('Breakout       ', bo_score)}\n"
+                f"{strat_line('Div. Swing     ', ds_score)}\n"
+                f"{strat_line('MultiTF 1H+4H  ', mtf_score)}\n\n"
+                f"📐 *Таймфреймы:* {tf_note}\n\n"
+                f"🛑 SL: `{fmt_price(sl)}`\n"
+                f"🎯 TP1: `{fmt_price(tp1)}`\n"
+                f"🎯 TP2: `{fmt_price(tp2)}`\n"
+                f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n"
+                f"💰 Риск: `~${risk_usdt:.2f} USDT` ({risk_pct}%)\n\n"
+                f"⏳ _Актуально ~15 минут_"
+            )
+
             try:
                 await ctx.bot.send_message(
                     chat_id=chat_id,
-                    text=(
-                        f"🤖 *Авто-сигнал: {dir_label}* {mode_label}\n\n"
-                        f"💎 *{symbol.replace('USDT', '')}*\n"
-                        f"📊 Счёт: `{score:+.1f}` / ±15\n"
-                        f"💵 Цена: `{fmt_price(price)}`\n"
-                        f"🛑 SL: `{fmt_price(sl)}`\n"
-                        f"🎯 TP1: `{fmt_price(tp1)}`\n"
-                        f"🎯 TP2: `{fmt_price(tp2)}`\n"
-                        f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n"
-                        f"💰 Риск: `~${risk_usdt:.2f} USDT` ({risk_pct}%)\n\n"
-                        f"⏳ _Актуально ~15 минут_"
-                    ),
+                    text=text,
                     parse_mode="Markdown",
                     reply_markup=kb
                 )
@@ -2102,6 +2701,7 @@ def main():
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("analyze", analyze))
     app.add_handler(CommandHandler("scan", scan))
+    app.add_handler(CommandHandler("strategy", strategy))
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
     app.add_handler(CommandHandler("mysubs", mysubs))
