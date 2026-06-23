@@ -1562,11 +1562,19 @@ def futures_signed_request(method, endpoint, api_key, api_secret, params=None, c
             r = requests.post(url, params=params, headers=headers, timeout=10)
         elif method == "DELETE":
             r = requests.delete(url, params=params, headers=headers, timeout=10)
-        r.raise_for_status()
-        return r.json()
+        try:
+            data = r.json()
+        except ValueError:
+            data = None
+        if r.status_code >= 400:
+            logger.error(f"Futures signed request error ({endpoint}): HTTP {r.status_code} {data}")
+            # Возвращаем тело ответа биржи (там обычно код+текст ошибки Binance),
+            # а не None — иначе вызывающий код теряет реальную причину сбоя.
+            return data if isinstance(data, dict) else {"msg": f"HTTP {r.status_code}, нет тела ответа"}
+        return data
     except Exception as e:
         logger.error(f"Futures signed request error ({endpoint}): {e}")
-        return None
+        return {"msg": f"Исключение запроса: {e}"}
 
 
 def get_futures_balance(api_key, api_secret, chat_id=None):
@@ -1625,6 +1633,20 @@ def set_leverage(symbol, leverage, api_key, api_secret, chat_id=None):
                                    {"symbol": symbol, "leverage": leverage}, chat_id=chat_id)
 
 
+def get_open_position_amt(symbol, api_key, api_secret, chat_id=None):
+    """Возвращает positionAmt (float) для символа, или None если не удалось узнать."""
+    data = futures_signed_request("GET", "fapi/v3/account", api_key, api_secret, chat_id=chat_id)
+    if not data or "positions" not in data:
+        return None
+    for p in data["positions"]:
+        if p.get("symbol") == symbol:
+            try:
+                return float(p["positionAmt"])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def place_futures_market_order(symbol, side, quantity, qty_precision, api_key, api_secret, chat_id=None):
     """Открывает рыночный ордер на фьючерсах."""
     qty = round(quantity, qty_precision)
@@ -1638,8 +1660,11 @@ def place_futures_market_order(symbol, side, quantity, qty_precision, api_key, a
 
 
 def place_sl_tp_orders(symbol, direction, sl_price, tp_price, quantity,
-                        price_precision, qty_precision, api_key, api_secret, chat_id=None):
-    """Ставит STOP_MARKET (SL) и TAKE_PROFIT_MARKET (TP) ордера."""
+                        price_precision, qty_precision, api_key, api_secret, chat_id=None,
+                        attempts=3, retry_delay=1.5):
+    """Ставит STOP_MARKET (SL) и TAKE_PROFIT_MARKET (TP) ордера.
+    Делает несколько попыток на случай временного сбоя биржи (важно — без
+    SL позиция остаётся полностью незащищённой)."""
     close_side = "SELL" if direction == "long" else "BUY"
     qty = round(quantity, qty_precision)
     sl_params = {
@@ -1652,8 +1677,21 @@ def place_sl_tp_orders(symbol, direction, sl_price, tp_price, quantity,
         "quantity": qty, "stopPrice": round(tp_price, price_precision),
         "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
     }
-    sl_res = futures_signed_request("POST", "fapi/v1/order", api_key, api_secret, sl_params, chat_id=chat_id)
-    tp_res = futures_signed_request("POST", "fapi/v1/order", api_key, api_secret, tp_params, chat_id=chat_id)
+
+    def _place_with_retry(params, label):
+        last_res = None
+        for attempt in range(1, attempts + 1):
+            res = futures_signed_request("POST", "fapi/v1/order", api_key, api_secret, params, chat_id=chat_id)
+            if res and "orderId" in res:
+                return res
+            last_res = res
+            logger.warning(f"{label} попытка {attempt}/{attempts} не удалась: {res}")
+            if attempt < attempts:
+                time.sleep(retry_delay)
+        return last_res
+
+    sl_res = _place_with_retry(sl_params, f"SL {symbol}")
+    tp_res = _place_with_retry(tp_params, f"TP {symbol}")
     return sl_res, tp_res
 
 
@@ -1705,13 +1743,37 @@ async def execute_trade(chat_id, trade_info, ctx):
     if fill_price == 0:
         fill_price = entry
 
-    sl_res, tp_res = place_sl_tp_orders(
-        symbol, direction, sl, tp1, qty,
-        price_precision, qty_precision,
-        keys["api_key"], keys["api_secret"], chat_id=chat_id
+    # Ждём, пока биржа реально "увидит" открытую позицию — иначе SL/TP с
+    # reduceOnly могут быть отклонены, потому что позиции ещё нет на её стороне
+    # (особенно заметно на demo/testnet, где обработка чуть медленнее).
+    loop = asyncio.get_event_loop()
+    position_confirmed = False
+    for _ in range(5):
+        await asyncio.sleep(1.0)
+        pos_amt = await loop.run_in_executor(
+            None, get_open_position_amt, symbol, keys["api_key"], keys["api_secret"], chat_id
+        )
+        if pos_amt is not None and abs(pos_amt) > 0:
+            position_confirmed = True
+            break
+
+    if not position_confirmed:
+        logger.warning(f"execute_trade {symbol}: позиция не подтвердилась за 5 попыток, пробуем поставить SL/TP всё равно")
+
+    sl_res, tp_res = await loop.run_in_executor(
+        None, place_sl_tp_orders, symbol, direction, sl, tp1, qty,
+        price_precision, qty_precision, keys["api_key"], keys["api_secret"], chat_id
     )
     sl_ok = sl_res and "orderId" in sl_res
     tp_ok = tp_res and "orderId" in tp_res
+
+    def _err_text(res):
+        # Markdown-небезопасные символы убираем, чтобы не сломать parse_mode
+        msg = (res or {}).get("msg", "нет ответа от биржи")
+        return str(msg).replace("`", "").replace("*", "").replace("_", " ")
+
+    sl_status = "✅" if sl_ok else f"⚠️ не выставлен: {_err_text(sl_res)}"
+    tp_status = "✅" if tp_ok else f"⚠️ не выставлен: {_err_text(tp_res)}"
 
     OPEN_AUTOTRADES.setdefault(chat_id, []).append({
         **trade_info,
@@ -1733,8 +1795,8 @@ async def execute_trade(chat_id, trade_info, ctx):
         f"💵 Вход: `{fmt_price(fill_price)}`\n"
         f"📦 Объём: `{qty}` (~`${notional:,.2f} USDT` маржи)\n"
         f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n"
-        f"🛑 SL: `{fmt_price(sl)}` {'✅' if sl_ok else '⚠️ не выставлен!'}\n"
-        f"🎯 TP: `{fmt_price(tp1)}` {'✅' if tp_ok else '⚠️ не выставлен!'}\n\n"
+        f"🛑 SL: `{fmt_price(sl)}` {sl_status}\n"
+        f"🎯 TP: `{fmt_price(tp1)}` {tp_status}\n\n"
         f"Используй `/autoportfolio` для отслеживания.\n"
         f"⚠️ _Торговля связана с риском потери средств._",
         parse_mode="Markdown"
