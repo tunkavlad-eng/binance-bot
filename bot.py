@@ -91,7 +91,7 @@ def fmt_change(change: float) -> str:
     return f"{arrow} {sign}{change:.2f}%"
 
 def signed_request(method, url, api_key, api_secret, params=None):
-    params = params or {}
+    params = dict(params) if params else {}
     params["timestamp"] = int(time.time() * 1000)
     query_string = "&".join(f"{k}={v}" for k, v in params.items())
     signature = hmac.new(api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
@@ -2349,7 +2349,12 @@ async def global_error_handler(update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def futures_signed_request(method, endpoint, api_key, api_secret, params=None, chat_id=None):
     """Подписанный запрос к Binance Futures API."""
-    params = params or {}
+    # ВАЖНО: делаем копию, а не мутируем словарь вызывающего кода. Иначе при
+    # повторных попытках (retry) с тем же params-словарём в нём остаются
+    # timestamp/recvWindow/signature от ПРОШЛОЙ попытки, которые попадают
+    # в строку для подписи следующего запроса и портят сигнатуру —
+    # именно это вызывало "Signature for this request is not valid" на SL/TP.
+    params = dict(params) if params else {}
     params["timestamp"] = int(time.time() * 1000)
     params["recvWindow"] = 5000
     # Подписываем в том же порядке, в котором параметры реально уйдут в запросе
