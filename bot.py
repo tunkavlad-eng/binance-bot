@@ -2437,6 +2437,37 @@ def get_symbol_info(symbol, chat_id=None):
     return 2, 3, 0.001
 
 
+_FUTURES_SYMBOLS_CACHE: dict = {}   # base_url -> {"symbols": set, "time": float}
+FUTURES_SYMBOLS_CACHE_TTL = 1800    # 30 минут — список инструментов меняется редко
+
+def get_futures_symbols(chat_id=None):
+    """
+    Множество символов, у которых РЕАЛЬНО есть фьючерсный контракт на текущей
+    бирже пользователя (demo или real — у них разные списки!). Кандидаты для
+    автоторговли сейчас берутся из спотового тикера (get_all_usdt_symbols),
+    и у части монет может не быть фьючерса вообще (только спот) — раньше это
+    приводило к ошибке "Invalid symbol" уже на этапе открытия позиции.
+    Кэшируется, чтобы не дёргать exchangeInfo на каждого кандидата.
+    """
+    base = get_futures_api(chat_id) if chat_id else REAL_FUTURES_API
+    now = time.time()
+    cached = _FUTURES_SYMBOLS_CACHE.get(base)
+    if cached and now - cached["time"] < FUTURES_SYMBOLS_CACHE_TTL:
+        return cached["symbols"]
+    try:
+        r = requests.get(f"{base}/fapi/v1/exchangeInfo", timeout=10)
+        r.raise_for_status()
+        symbols = {
+            s["symbol"] for s in r.json().get("symbols", [])
+            if s.get("status") == "TRADING"
+        }
+        _FUTURES_SYMBOLS_CACHE[base] = {"symbols": symbols, "time": now}
+        return symbols
+    except Exception as e:
+        logger.warning(f"get_futures_symbols error: {e}")
+        return cached["symbols"] if cached else set()
+
+
 def set_leverage(symbol, leverage, api_key, api_secret, chat_id=None):
     return futures_signed_request("POST", "fapi/v1/leverage", api_key, api_secret,
                                    {"symbol": symbol, "leverage": leverage}, chat_id=chat_id)
@@ -2896,12 +2927,25 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
             continue
 
         open_symbols = {t["symbol"] for t in OPEN_AUTOTRADES.get(chat_id, [])}
+        futures_symbols = get_futures_symbols(chat_id=chat_id)
+
+        # Собираем ВСЕХ кандидатов, прошедших фильтры, а не берём первого
+        # попавшегося — раньше longs всегда шли первыми в списке candidates,
+        # и из-за break после первого же подходящего лонга шорты в этом же
+        # цикле часто даже не успевали проверяться.
+        qualified = []
 
         for candidate in candidates:
             symbol     = candidate["symbol"]
             quick_score = candidate["score"]
 
             if symbol in open_symbols:
+                continue
+            # Кандидаты приходят из спотового скана — у части монет может не
+            # быть фьючерсного контракта вообще (или его нет на demo), и тогда
+            # открытие позиции упало бы с "Invalid symbol" уже на бирже.
+            if futures_symbols and symbol not in futures_symbols:
+                logger.info(f"autotrade {symbol}: нет фьючерсного контракта на текущей бирже ({USER_MODE.get(chat_id, 'real')}) — пропускаем")
                 continue
             if abs(quick_score) < AUTOTRADE_SCORE_THRESHOLD:
                 continue
@@ -2981,221 +3025,99 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
                 if (direction == "long" and s > 0) or (direction == "short" and s < 0)
             )
 
-            trade_id = str(uuid.uuid4())[:8]
-            PENDING_TRADES[trade_id] = {
-                "symbol": symbol, "direction": direction,
-                "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
-                "score": combined,
-            }
+            qualified.append({
+                "symbol": symbol, "direction": direction, "dir_label": dir_label,
+                "price": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+                "quick_score": quick_score, "strat_total": strat_total, "combined": combined,
+                "agree_count": agree_count,
+                "mr_score": mr_score, "tp_score": tp_score, "bo_score": bo_score,
+                "ds_score": ds_score, "mtf_score": mtf_score,
+                "tf_align": tf_align, "fr_note": fr_note,
+            })
 
-            risk_pct  = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
-            risk_usdt = balance * risk_pct / 100
-            mode      = USER_MODE.get(chat_id, "real")
-            mode_label = "🧪 DEMO" if mode == "demo" else "💰 REAL"
-
-            # BTC статус для карточки
-            btc_map = {
-                "strong_up": "🚀 Сильный рост", "up": "📈 Рост",
-                "strong_down": "💥 Сильное падение", "down": "📉 Падение", "neutral": "⚪ Боковик"
-            }
-            btc_note = f"BTC: {btc_map.get(btc_trend, btc_trend)}"
-            tf_note  = "✅ 1H и 4H совпадают" if tf_align else "⚠️ 1H/4H расходятся"
-
-            def strat_line(name, sc):
-                if (direction == "long" and sc > 0) or (direction == "short" and sc < 0):
-                    return f"  ✅ {name}: `{sc:+.1f}`"
-                elif sc == 0:
-                    return f"  ⚪ {name}: нейтрально"
-                return f"  ❌ {name}: `{sc:+.1f}` (против)"
-
-            daily_loss = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0)
-            limit_usdt = balance * DAILY_LOSS_LIMIT_PCT / 100
-
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(f"✅ Войти (~${risk_usdt:.0f} риск)", callback_data=f"trade_confirm:{trade_id}"),
-                InlineKeyboardButton("❌ Отмена", callback_data=f"trade_cancel:{trade_id}"),
-            ]])
-
-            text = (
-                f"🤖 *Авто-сигнал: {dir_label}* {mode_label}\n\n"
-                f"💎 *{symbol.replace('USDT', '')}*  |  `{fmt_price(price)}`\n"
-                f"📊 Скан: `{quick_score:+.1f}` | Стратегии: `{strat_total:+.1f}` | Итого: `{combined:+.1f}`\n"
-                f"🔢 Согласны {agree_count}/5 стратегий\n\n"
-                f"*📋 Стратегии:*\n"
-                f"{strat_line('Mean Reversion', mr_score)}\n"
-                f"{strat_line('Trend Pullback', tp_score)}\n"
-                f"{strat_line('Breakout      ', bo_score)}\n"
-                f"{strat_line('Div. Swing    ', ds_score)}\n"
-                f"{strat_line('MultiTF 1H+4H ', mtf_score)}\n\n"
-                f"📐 {tf_note}  |  {btc_note}\n"
-                + (f"⚡ {fr_note}\n" if fr_note else "") +
-                f"\n🛑 SL: `{fmt_price(sl)}`\n"
-                f"🎯 TP1 (50%): `{fmt_price(tp1)}`\n"
-                f"🎯 TP2 (50%): `{fmt_price(tp2)}`\n"
-                f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n"
-                f"💰 Риск: `~${risk_usdt:.2f}` ({risk_pct}%)\n"
-                f"🛡 Дн. убыток: `${daily_loss:.2f}` / `${limit_usdt:.2f}`\n\n"
-                f"⏳ _Актуально ~15 минут_"
-            )
-
-            try:
-                await ctx.bot.send_message(chat_id=chat_id, text=text,
-                                           parse_mode="Markdown", reply_markup=kb)
-                break
-            except Exception as e:
-                logger.warning(f"autotrade_scan_job {chat_id}: {e}")
-    import uuid
-    active_users = [cid for cid, on in AUTOTRADE_ENABLED.items() if on]
-    if not active_users:
-        return
-
-    loop = asyncio.get_running_loop()
-    longs, shorts = await loop.run_in_executor(None, scan_market)
-    candidates = longs + shorts
-
-    for chat_id in active_users:
-        if chat_id not in USER_KEYS:
+        if not qualified:
             continue
 
-        open_symbols = {t["symbol"] for t in OPEN_AUTOTRADES.get(chat_id, [])}
+        # Выбираем сигнал с максимальным |combined| среди всех прошедших
+        # фильтры — а не первый по порядку (раньше это всегда были лонги).
+        best = max(qualified, key=lambda q: abs(q["combined"]))
 
-        for candidate in candidates:
-            symbol = candidate["symbol"]
-            quick_score = candidate["score"]
+        symbol, direction, dir_label = best["symbol"], best["direction"], best["dir_label"]
+        price, sl, tp1, tp2 = best["price"], best["sl"], best["tp1"], best["tp2"]
+        quick_score, strat_total, combined = best["quick_score"], best["strat_total"], best["combined"]
+        agree_count = best["agree_count"]
+        mr_score, tp_score, bo_score, ds_score, mtf_score = (
+            best["mr_score"], best["tp_score"], best["bo_score"], best["ds_score"], best["mtf_score"]
+        )
+        tf_align, fr_note = best["tf_align"], best["fr_note"]
 
-            if symbol in open_symbols:
-                continue
-            if abs(quick_score) < AUTOTRADE_SCORE_THRESHOLD:
-                continue
+        trade_id = str(uuid.uuid4())[:8]
+        PENDING_TRADES[trade_id] = {
+            "symbol": symbol, "direction": direction,
+            "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+            "score": combined,
+        }
 
-            # ── Загружаем 1H и 4H для детального анализа ──
-            k1h = get_klines(symbol, "1h", 200)
-            k4h = get_klines(symbol, "4h", 200)
-            if not k1h:
-                continue
+        risk_pct  = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
+        risk_usdt = balance * risk_pct / 100
+        mode      = USER_MODE.get(chat_id, "real")
+        mode_label = "🧪 DEMO" if mode == "demo" else "💰 REAL"
 
-            df1h = klines_to_df(k1h)
-            r1h  = full_analysis(df1h)
+        # BTC статус для карточки
+        btc_map = {
+            "strong_up": "🚀 Сильный рост", "up": "📈 Рост",
+            "strong_down": "💥 Сильное падение", "down": "📉 Падение", "neutral": "⚪ Боковик"
+        }
+        btc_note = f"BTC: {btc_map.get(btc_trend, btc_trend)}"
+        tf_note  = "✅ 1H и 4H совпадают" if tf_align else "⚠️ 1H/4H расходятся"
 
-            df4h = r4h = None
-            if k4h and len(k4h) >= 50:
-                df4h = klines_to_df(k4h)
-                r4h  = full_analysis(df4h)
+        def strat_line(name, sc):
+            if (direction == "long" and sc > 0) or (direction == "short" and sc < 0):
+                return f"  ✅ {name}: `{sc:+.1f}`"
+            elif sc == 0:
+                return f"  ⚪ {name}: нейтрально"
+            return f"  ❌ {name}: `{sc:+.1f}` (против)"
 
-            # ── Запускаем все 5 стратегий ──
-            strat_results, strat_total, tf_align = run_all_strategies(df1h, r1h, df4h, r4h)
+        daily_loss = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0)
+        limit_usdt = balance * DAILY_LOSS_LIMIT_PCT / 100
 
-            # Разбивка по стратегиям для карточки
-            mr_score,  _ = strat_results.get("mean_reversion",   (0, []))
-            tp_score,  _ = strat_results.get("trend_pullback",    (0, []))
-            bo_score,  _ = strat_results.get("breakout",          (0, []))
-            ds_score,  _ = strat_results.get("divergence_swing",  (0, []))
-            mtf_score, _ = strat_results.get("multitf",           (0, []))
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"✅ Войти (~${risk_usdt:.0f} риск)", callback_data=f"trade_confirm:{trade_id}"),
+            InlineKeyboardButton("❌ Отмена", callback_data=f"trade_cancel:{trade_id}"),
+        ]])
 
-            # ── Объединяем: quick_score (скан) + strat_total (5 стратегий) ──
-            # Нормируем quick_score к той же шкале что и strat_total
-            combined = quick_score * 1.0 + strat_total * 0.5
+        extra_note = (
+            f"\n_Выбран сильнейший сигнал из {len(qualified)}, прошедших фильтры в этом цикле._"
+            if len(qualified) > 1 else ""
+        )
 
-            # Направление должно совпадать у обоих источников
-            quick_dir = "long"  if quick_score  > 0 else "short"
-            strat_dir = "long"  if strat_total  > 0 else "short"
+        text = (
+            f"🤖 *Авто-сигнал: {dir_label}* {mode_label}\n\n"
+            f"💎 *{symbol.replace('USDT', '')}*  |  `{fmt_price(price)}`\n"
+            f"📊 Скан: `{quick_score:+.1f}` | Стратегии: `{strat_total:+.1f}` | Итого: `{combined:+.1f}`\n"
+            f"🔢 Согласны {agree_count}/5 стратегий\n\n"
+            f"*📋 Стратегии:*\n"
+            f"{strat_line('Mean Reversion', mr_score)}\n"
+            f"{strat_line('Trend Pullback', tp_score)}\n"
+            f"{strat_line('Breakout      ', bo_score)}\n"
+            f"{strat_line('Div. Swing    ', ds_score)}\n"
+            f"{strat_line('MultiTF 1H+4H ', mtf_score)}\n\n"
+            f"📐 {tf_note}  |  {btc_note}\n"
+            + (f"⚡ {fr_note}\n" if fr_note else "") +
+            f"\n🛑 SL: `{fmt_price(sl)}`\n"
+            f"🎯 TP1 (50%): `{fmt_price(tp1)}`\n"
+            f"🎯 TP2 (50%): `{fmt_price(tp2)}`\n"
+            f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n"
+            f"💰 Риск: `~${risk_usdt:.2f}` ({risk_pct}%)\n"
+            f"🛡 Дн. убыток: `${daily_loss:.2f}` / `${limit_usdt:.2f}`\n"
+            f"⏳ _Актуально ~15 минут_{extra_note}"
+        )
 
-            if quick_dir != strat_dir:
-                logger.info(
-                    f"autotrade {symbol}: quick={quick_score:+.1f} vs strat={strat_total:+.1f} — "
-                    f"направления расходятся, пропускаем"
-                )
-                continue
-
-            # Минимальный порог комбинированного счёта
-            min_combined = AUTOTRADE_SCORE_THRESHOLD * 1.2
-            if abs(combined) < min_combined:
-                continue
-
-            direction = quick_dir
-            price = df1h["close"].iloc[-1]
-            atr   = calc_atr(df1h, 14).iloc[-1]
-            risk  = atr * 1.5
-
-            if direction == "long":
-                sl, tp1, tp2 = price - risk, price + risk * 1.5, price + risk * 3.0
-                dir_label = "🟢 LONG"
-            else:
-                sl, tp1, tp2 = price + risk, price - risk * 1.5, price - risk * 3.0
-                dir_label = "🔴 SHORT"
-
-            # Считаем сколько стратегий согласны с направлением
-            strat_scores = [mr_score, tp_score, bo_score, ds_score, mtf_score]
-            agree_count = sum(
-                1 for s in strat_scores
-                if (direction == "long" and s > 0) or (direction == "short" and s < 0)
-            )
-
-            trade_id = str(uuid.uuid4())[:8]
-            PENDING_TRADES[trade_id] = {
-                "symbol": symbol, "direction": direction,
-                "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
-                "score": combined,
-            }
-
-            keys     = USER_KEYS[chat_id]
-            bal      = get_futures_balance(keys["api_key"], keys["api_secret"], chat_id=chat_id) or 0
-            risk_pct = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
-            risk_usdt = bal * risk_pct / 100
-
-            mode       = USER_MODE.get(chat_id, "real")
-            mode_label = "🧪 DEMO" if mode == "demo" else "💰 REAL"
-
-            # Строки по каждой стратегии
-            def strat_line(name, sc):
-                if (direction == "long" and sc > 0) or (direction == "short" and sc < 0):
-                    return f"  ✅ {name}: `{sc:+.1f}`"
-                elif sc == 0:
-                    return f"  ⚪ {name}: нейтрально"
-                else:
-                    return f"  ❌ {name}: `{sc:+.1f}` (против)"
-
-            tf_note = "✅ 1H и 4H совпадают" if tf_align else "⚠️ 1H и 4H расходятся"
-
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    f"✅ Войти (~${risk_usdt:.0f} риск)",
-                    callback_data=f"trade_confirm:{trade_id}"
-                ),
-                InlineKeyboardButton("❌ Отмена", callback_data=f"trade_cancel:{trade_id}"),
-            ]])
-
-            text = (
-                f"🤖 *Авто-сигнал: {dir_label}* {mode_label}\n\n"
-                f"💎 *{symbol.replace('USDT', '')}*\n"
-                f"💵 Цена: `{fmt_price(price)}`\n"
-                f"📊 Скан (1H): `{quick_score:+.1f}` | Стратегии: `{strat_total:+.1f}`\n"
-                f"🔢 Итого: `{combined:+.1f}` | Согласны {agree_count}/5 стратегий\n\n"
-                f"*📋 Разбивка стратегий:*\n"
-                f"{strat_line('Mean Reversion ', mr_score)}\n"
-                f"{strat_line('Trend Pullback ', tp_score)}\n"
-                f"{strat_line('Breakout       ', bo_score)}\n"
-                f"{strat_line('Div. Swing     ', ds_score)}\n"
-                f"{strat_line('MultiTF 1H+4H  ', mtf_score)}\n\n"
-                f"📐 *Таймфреймы:* {tf_note}\n\n"
-                f"🛑 SL: `{fmt_price(sl)}`\n"
-                f"🎯 TP1: `{fmt_price(tp1)}`\n"
-                f"🎯 TP2: `{fmt_price(tp2)}`\n"
-                f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n"
-                f"💰 Риск: `~${risk_usdt:.2f} USDT` ({risk_pct}%)\n\n"
-                f"⏳ _Актуально ~15 минут_"
-            )
-
-            try:
-                await ctx.bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    parse_mode="Markdown",
-                    reply_markup=kb
-                )
-                break  # один сигнал за раз на пользователя
-            except Exception as e:
-                logger.warning(f"autotrade_scan_job {chat_id}: {e}")
+        try:
+            await ctx.bot.send_message(chat_id=chat_id, text=text,
+                                       parse_mode="Markdown", reply_markup=kb)
+        except Exception as e:
+            logger.warning(f"autotrade_scan_job {chat_id}: {e}")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
