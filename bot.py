@@ -49,7 +49,27 @@ OPEN_AUTOTRADES: dict[int, list] = {}         # chat_id -> список откр
 AUTOTRADE_SCORE_THRESHOLD = 5.0              # порог сигнала
 DEFAULT_LEVERAGE = 3                          # плечо по умолчанию
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ─── Дневной лимит убытков ────────────────────────────────────────────────────
+DAILY_LOSS_LIMIT_PCT = 5.0                   # максимальный дневной убыток в % от баланса
+AUTOTRADE_DAILY_LOSS: dict[int, float] = {}  # chat_id -> сумма убытков за сегодня ($)
+AUTOTRADE_DAILY_DATE: dict[int, str]  = {}   # chat_id -> дата последнего сброса
+AUTOTRADE_PAUSED:     dict[int, bool] = {}   # chat_id -> пауза из-за дневного лимита
+
+# ─── BTC режим (кэш) ─────────────────────────────────────────────────────────
+_BTC_TREND_CACHE: dict = {"trend": None, "updated_at": 0}  # обновляем раз в 30 мин
+
+# ─── Дневной лимит убытков ────────────────────────────────────────────────────
+DAILY_LOSS_LIMIT_PCT = 5.0                   # максимальный дневной убыток в % от баланса
+AUTOTRADE_DAILY_LOSS: dict[int, float] = {}  # chat_id -> сумма убытков за сегодня ($)
+AUTOTRADE_DAILY_DATE: dict[int, str]  = {}   # chat_id -> дата последнего сброса
+
+# ─── Funding Rate пороги (только экстремальные значения) ──────────────────────
+FUNDING_EXTREME_HIGH =  0.10   # % — рынок перегрет лонгами → шорт-сигнал
+FUNDING_EXTREME_LOW  = -0.05   # % — рынок перегрет шортами → лонг-сигнал
+
+# ─── BTC режим (фильтр лонгов по альтам) ─────────────────────────────────────
+BTC_REGIME_CACHE: dict = {}    # {"trend": str, "time": float}
+BTC_CACHE_TTL = 300            # секунд (5 мин)
 
 def normalize_symbol(symbol: str) -> str:
     symbol = symbol.upper().strip()
@@ -84,6 +104,82 @@ def signed_request(method, url, api_key, api_secret, params=None):
     except Exception as e:
         logger.error(f"Signed request error: {e}")
         return None
+
+def get_btc_regime() -> str:
+    """Возвращает текущий тренд BTC (кэшируется на 5 мин)."""
+    now = time.time()
+    if BTC_REGIME_CACHE.get("time", 0) + BTC_CACHE_TTL > now:
+        return BTC_REGIME_CACHE.get("trend", "neutral")
+    try:
+        klines = get_klines("BTCUSDT", "4h", 200)
+        if not klines:
+            return "neutral"
+        df = klines_to_df(klines)
+        close = df["close"]
+        ema20 = calc_ema(close, 20).iloc[-1]
+        ema50 = calc_ema(close, 50).iloc[-1]
+        ema200 = calc_ema(close, 200).iloc[-1]
+        p = close.iloc[-1]
+        if p > ema20 > ema50 > ema200:
+            trend = "strong_up"
+        elif p > ema50 > ema200:
+            trend = "up"
+        elif p < ema20 and p < ema50 and p < ema200:
+            trend = "strong_down"
+        elif p < ema50:
+            trend = "down"
+        else:
+            trend = "neutral"
+        BTC_REGIME_CACHE["trend"] = trend
+        BTC_REGIME_CACHE["time"]  = now
+        return trend
+    except Exception as e:
+        logger.warning(f"get_btc_regime error: {e}")
+        return "neutral"
+
+
+def get_funding_signal(symbol: str) -> tuple[float, str | None]:
+    """
+    Возвращает (funding_rate_pct, signal).
+    signal = 'long' если funding экстремально отрицательный (перегрет шортами),
+             'short' если экстремально положительный (перегрет лонгами),
+             None если значение обычное.
+    Работает ТОЛЬКО в экстремальных ситуациях.
+    """
+    try:
+        data = get_funding_rate(symbol)
+        if not data or "lastFundingRate" not in data:
+            return 0.0, None
+        fr = float(data["lastFundingRate"]) * 100
+        if fr >= FUNDING_EXTREME_HIGH:
+            return fr, "short"   # рынок перегрет лонгами → сигнал к шорту
+        elif fr <= FUNDING_EXTREME_LOW:
+            return fr, "long"    # рынок перегрет шортами → сигнал к лонгу
+        return fr, None
+    except Exception:
+        return 0.0, None
+
+
+def check_daily_loss_limit(chat_id: int, balance: float) -> bool:
+    """
+    Возвращает True если дневной лимит убытков НЕ превышен (можно торговать).
+    Сбрасывает счётчик если наступил новый день.
+    """
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if AUTOTRADE_DAILY_DATE.get(chat_id) != today:
+        AUTOTRADE_DAILY_LOSS[chat_id] = 0.0
+        AUTOTRADE_DAILY_DATE[chat_id] = today
+
+    daily_loss = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0)
+    limit_usdt = balance * DAILY_LOSS_LIMIT_PCT / 100
+    return daily_loss < limit_usdt
+
+
+def record_trade_pnl(chat_id: int, pnl_usdt: float):
+    """Записывает PnL сделки в дневной счётчик убытков."""
+    if pnl_usdt < 0:
+        AUTOTRADE_DAILY_LOSS[chat_id] = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0) + abs(pnl_usdt)
+
 
 def get_ticker_24h(symbol):
     try:
@@ -136,7 +232,189 @@ def get_top_movers(limit=5):
     except:
         return [], []
 
-# ─── Technical Analysis ───────────────────────────────────────────────────────
+# ─── BTC Режим рынка ──────────────────────────────────────────────────────────
+
+def get_btc_trend() -> str | None:
+    """
+    Возвращает тренд BTC на 4H: strong_up / up / neutral / down / strong_down.
+    Кэшируется на 30 минут чтобы не спамить API при каждом скане.
+    """
+    now = time.time()
+    if now - _BTC_TREND_CACHE["updated_at"] < 1800 and _BTC_TREND_CACHE["trend"]:
+        return _BTC_TREND_CACHE["trend"]
+
+    try:
+        klines = get_klines("BTCUSDT", "4h", 210)
+        if not klines or len(klines) < 210:
+            return None
+        df = klines_to_df(klines)
+        close = df["close"]
+
+        ema20  = calc_ema(close, 20).iloc[-1]
+        ema50  = calc_ema(close, 50).iloc[-1]
+        ema200 = calc_ema(close, 200).iloc[-1]
+        p = close.iloc[-1]
+
+        if p > ema20 > ema50 > ema200:
+            trend = "strong_up"
+        elif p > ema50 > ema200:
+            trend = "up"
+        elif p < ema20 and p < ema50 and p < ema200:
+            trend = "strong_down"
+        elif p < ema50:
+            trend = "down"
+        else:
+            trend = "neutral"
+
+        _BTC_TREND_CACHE["trend"] = trend
+        _BTC_TREND_CACHE["updated_at"] = now
+        logger.info(f"BTC 4H тренд обновлён: {trend}")
+        return trend
+    except Exception as e:
+        logger.warning(f"get_btc_trend error: {e}")
+        return None
+
+
+def btc_regime_allows(direction: str) -> tuple[bool, str]:
+    """
+    Проверяет разрешает ли режим BTC открывать позицию в данном направлении.
+    Возвращает (разрешено, причина).
+    Блокирует: лонги при strong_down BTC, шорты при strong_up BTC.
+    """
+    trend = get_btc_trend()
+    if trend is None:
+        return True, "BTC тренд неизвестен — фильтр пропущен"
+
+    trend_labels = {
+        "strong_up":   "🚀 BTC сильный рост",
+        "up":          "📈 BTC рост",
+        "neutral":     "⚪ BTC боковик",
+        "down":        "📉 BTC падение",
+        "strong_down": "💥 BTC сильное падение",
+    }
+    label = trend_labels.get(trend, trend)
+
+    if direction == "long" and trend == "strong_down":
+        return False, f"❌ Лонг заблокирован: {label}"
+    if direction == "short" and trend == "strong_up":
+        return False, f"❌ Шорт заблокирован: {label}"
+    return True, f"✅ BTC режим: {label}"
+
+
+# ─── Funding Rate фильтр ──────────────────────────────────────────────────────
+
+FUNDING_EXTREME_LONG  =  0.10   # % — рынок перегрет лонгами → шорт-сигнал
+FUNDING_EXTREME_SHORT = -0.05   # % — рынок перегрет шортами → лонг-сигнал
+
+def get_funding_signal(symbol: str) -> tuple[float, str]:
+    """
+    Возвращает (score_delta, описание).
+    Работает ТОЛЬКО при экстремальных значениях funding rate.
+    В обычное время возвращает (0, "").
+    """
+    data = get_funding_rate(symbol)
+    if not data or "lastFundingRate" not in data:
+        return 0.0, ""
+
+    fr = float(data["lastFundingRate"]) * 100  # переводим в %
+
+    if fr >= FUNDING_EXTREME_LONG:
+        # Рынок перегрет лонгами — сигнал к шорту
+        intensity = min((fr - FUNDING_EXTREME_LONG) / 0.05, 2.0)
+        score = -(1.0 + intensity)
+        return round(score, 2), f"⚠️ Funding ЭКСТРЕМАЛЬНЫЙ ({fr:+.3f}%) — перегрев лонгов, шорт-давление"
+
+    if fr <= FUNDING_EXTREME_SHORT:
+        # Рынок перегрет шортами — сигнал к лонгу
+        intensity = min((abs(fr) - abs(FUNDING_EXTREME_SHORT)) / 0.03, 2.0)
+        score = 1.0 + intensity
+        return round(score, 2), f"⚠️ Funding ЭКСТРЕМАЛЬНЫЙ ({fr:+.3f}%) — перегрев шортов, лонг-давление"
+
+    return 0.0, ""  # обычный диапазон — игнорируем
+
+
+# ─── Дневной лимит убытков ────────────────────────────────────────────────────
+
+def check_daily_loss_limit(chat_id: int, balance: float) -> tuple[bool, str]:
+    """
+    Проверяет не превышен ли дневной лимит убытков.
+    Возвращает (торговля_разрешена, сообщение).
+    """
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # Сброс счётчика в новый день
+    if AUTOTRADE_DAILY_DATE.get(chat_id) != today:
+        AUTOTRADE_DAILY_DATE[chat_id] = today
+        AUTOTRADE_DAILY_LOSS[chat_id] = 0.0
+        AUTOTRADE_PAUSED[chat_id] = False
+
+    if AUTOTRADE_PAUSED.get(chat_id, False):
+        loss = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0)
+        limit = balance * DAILY_LOSS_LIMIT_PCT / 100
+        return False, (
+            f"🛑 Автоторговля приостановлена на сегодня\n"
+            f"Дневной убыток: `${loss:.2f}` / лимит `${limit:.2f}` ({DAILY_LOSS_LIMIT_PCT}%)\n"
+            f"Возобновится завтра автоматически."
+        )
+    return True, ""
+
+
+def record_trade_result(chat_id: int, pnl_usd: float, balance: float):
+    """
+    Записывает результат сделки. Если убыток превысил дневной лимит — ставит паузу.
+    """
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if AUTOTRADE_DAILY_DATE.get(chat_id) != today:
+        AUTOTRADE_DAILY_DATE[chat_id] = today
+        AUTOTRADE_DAILY_LOSS[chat_id] = 0.0
+
+    if pnl_usd < 0:
+        AUTOTRADE_DAILY_LOSS[chat_id] = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0) + abs(pnl_usd)
+
+    limit = balance * DAILY_LOSS_LIMIT_PCT / 100
+    if AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0) >= limit:
+        AUTOTRADE_PAUSED[chat_id] = True
+        logger.warning(f"chat_id={chat_id}: дневной лимит убытков достигнут, автоторговля приостановлена")
+
+
+# ─── Частичное закрытие позиции ───────────────────────────────────────────────
+
+def place_partial_tp_orders(symbol, direction, tp1_price, tp2_price, quantity,
+                             price_precision, qty_precision, api_key, api_secret, chat_id=None):
+    """
+    Ставит два TP ордера:
+    - TP1: 50% объёма (фиксируем половину прибыли)
+    - TP2: оставшиеся 50% (ловим большое движение)
+    """
+    close_side = "SELL" if direction == "long" else "BUY"
+    qty_half = max(round(quantity / 2, qty_precision), 0.001)
+    qty_rest = max(round(quantity - qty_half, qty_precision), 0.001)
+
+    tp1_params = {
+        "symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
+        "quantity": qty_half,
+        "stopPrice": round(tp1_price, price_precision),
+        "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
+    }
+    tp2_params = {
+        "symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
+        "quantity": qty_rest,
+        "stopPrice": round(tp2_price, price_precision),
+        "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
+    }
+
+    def _try(params, label):
+        for attempt in range(1, 4):
+            res = futures_signed_request("POST", "fapi/v1/order", api_key, api_secret, params, chat_id=chat_id)
+            if res and "orderId" in res:
+                return res
+            logger.warning(f"{label} попытка {attempt}/3: {res}")
+            time.sleep(1.5)
+        return res
+
+    tp1_res = _try(tp1_params, f"TP1 {symbol}")
+    tp2_res = _try(tp2_params, f"TP2 {symbol}")
+    return tp1_res, tp2_res
 
 def klines_to_df(klines):
     df = pd.DataFrame(klines, columns=[
@@ -2228,20 +2506,36 @@ async def execute_trade(chat_id, trade_info, ctx):
         await ctx.bot.send_message(chat_id, "❌ API ключи не найдены.")
         return
 
-    symbol = trade_info["symbol"]
+    symbol    = trade_info["symbol"]
     direction = trade_info["direction"]
-    sl = trade_info["sl"]
-    tp1 = trade_info["tp1"]
-    entry = trade_info["entry"]
-    mode = USER_MODE.get(chat_id, "real")
+    sl        = trade_info["sl"]
+    tp1       = trade_info["tp1"]
+    tp2       = trade_info.get("tp2", tp1)
+    entry     = trade_info["entry"]
+    mode      = USER_MODE.get(chat_id, "real")
     mode_label = "🧪 DEMO" if mode == "demo" else "💰 REAL"
 
     balance = get_futures_balance(keys["api_key"], keys["api_secret"], chat_id=chat_id)
     if not balance or balance < 10:
-        await ctx.bot.send_message(chat_id, "❌ Недостаточно средств на фьючерсном балансе (минимум $10).")
+        await ctx.bot.send_message(chat_id, "❌ Недостаточно средств (минимум $10).")
         return
 
-    risk_pct = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
+    # ── Проверка дневного лимита убытков ──────────────────────────────────────
+    if not check_daily_loss_limit(chat_id, balance):
+        daily_loss = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0)
+        limit_usdt = balance * DAILY_LOSS_LIMIT_PCT / 100
+        await ctx.bot.send_message(
+            chat_id,
+            f"🛑 *Дневной лимит убытков достигнут*\n\n"
+            f"Потеряно сегодня: `${daily_loss:.2f}`\n"
+            f"Лимит: `${limit_usdt:.2f}` ({DAILY_LOSS_LIMIT_PCT}% баланса)\n\n"
+            f"Автоторговля приостановлена до UTC 00:00.\n"
+            f"_Это защита депозита — не отключай её._",
+            parse_mode="Markdown"
+        )
+        return
+
+    risk_pct  = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
     risk_usdt = balance * risk_pct / 100
     price_precision, qty_precision, min_qty = get_symbol_info(symbol, chat_id=chat_id)
 
@@ -2250,14 +2544,16 @@ async def execute_trade(chat_id, trade_info, ctx):
         await ctx.bot.send_message(chat_id, "❌ Ошибка расчёта риска (SL = цена входа).")
         return
 
-    # qty = сколько монет купить, чтобы при достижении SL потерять ровно risk_usdt
-    qty = risk_usdt / atr_risk_price
-    qty = max(round(qty, qty_precision), min_qty or 0.001)
+    qty_total = risk_usdt / atr_risk_price
+    qty_total = max(round(qty_total, qty_precision), min_qty or 0.001)
+
+    # ── Частичное закрытие: 50% на TP1, 50% на TP2 ──────────────────────────
+    qty_half = max(round(qty_total / 2, qty_precision), min_qty or 0.001)
 
     set_leverage(symbol, DEFAULT_LEVERAGE, keys["api_key"], keys["api_secret"], chat_id=chat_id)
 
-    side = "BUY" if direction == "long" else "SELL"
-    order = place_futures_market_order(symbol, side, qty, qty_precision,
+    side  = "BUY" if direction == "long" else "SELL"
+    order = place_futures_market_order(symbol, side, qty_total, qty_precision,
                                        keys["api_key"], keys["api_secret"], chat_id=chat_id)
 
     if not order or "orderId" not in order:
@@ -2269,9 +2565,7 @@ async def execute_trade(chat_id, trade_info, ctx):
     if fill_price == 0:
         fill_price = entry
 
-    # Ждём, пока биржа реально "увидит" открытую позицию — иначе SL/TP с
-    # reduceOnly могут быть отклонены, потому что позиции ещё нет на её стороне
-    # (особенно заметно на demo/testnet, где обработка чуть медленнее).
+    # Ждём подтверждения позиции биржей
     loop = asyncio.get_event_loop()
     position_confirmed = False
     for _ in range(5):
@@ -2284,45 +2578,74 @@ async def execute_trade(chat_id, trade_info, ctx):
             break
 
     if not position_confirmed:
-        logger.warning(f"execute_trade {symbol}: позиция не подтвердилась за 5 попыток, пробуем поставить SL/TP всё равно")
+        logger.warning(f"execute_trade {symbol}: позиция не подтвердилась за 5 попыток")
 
-    sl_res, tp_res = await loop.run_in_executor(
-        None, place_sl_tp_orders, symbol, direction, sl, tp1, qty,
+    # ── SL на полный объём ───────────────────────────────────────────────────
+    sl_res, _ = await loop.run_in_executor(
+        None, place_sl_tp_orders, symbol, direction, sl, tp1, qty_total,
         price_precision, qty_precision, keys["api_key"], keys["api_secret"], chat_id
     )
-    sl_ok = sl_res and "orderId" in sl_res
-    tp_ok = tp_res and "orderId" in tp_res
 
-    def _err_text(res):
-        # Markdown-небезопасные символы убираем, чтобы не сломать parse_mode
-        msg = (res or {}).get("msg", "нет ответа от биржи")
-        return str(msg).replace("`", "").replace("*", "").replace("_", " ")
+    # ── TP1 на 50% объёма ────────────────────────────────────────────────────
+    close_side = "SELL" if direction == "long" else "BUY"
+    tp1_params = {
+        "symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
+        "quantity": round(qty_half, qty_precision),
+        "stopPrice": round(tp1, price_precision),
+        "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
+    }
+    tp1_res = futures_signed_request(
+        "POST", "fapi/v1/order", keys["api_key"], keys["api_secret"], tp1_params, chat_id=chat_id
+    )
 
-    sl_status = "✅" if sl_ok else f"⚠️ не выставлен: {_err_text(sl_res)}"
-    tp_status = "✅" if tp_ok else f"⚠️ не выставлен: {_err_text(tp_res)}"
+    # ── TP2 на оставшиеся 50% ────────────────────────────────────────────────
+    tp2_params = {
+        "symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
+        "quantity": round(qty_half, qty_precision),
+        "stopPrice": round(tp2, price_precision),
+        "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
+    }
+    tp2_res = futures_signed_request(
+        "POST", "fapi/v1/order", keys["api_key"], keys["api_secret"], tp2_params, chat_id=chat_id
+    )
+
+    sl_ok  = sl_res  and "orderId" in sl_res
+    tp1_ok = tp1_res and "orderId" in tp1_res
+    tp2_ok = tp2_res and "orderId" in tp2_res
+
+    def _err(res):
+        msg = (res or {}).get("msg", "нет ответа")
+        return str(msg).replace("`","").replace("*","").replace("_"," ")
 
     OPEN_AUTOTRADES.setdefault(chat_id, []).append({
         **trade_info,
-        "entry": fill_price,
-        "qty": qty,
-        "order_id": order["orderId"],
-        "sl_order_id": sl_res.get("orderId") if sl_ok else None,
-        "tp_order_id": tp_res.get("orderId") if tp_ok else None,
-        "opened_at": datetime.utcnow().isoformat(),
+        "entry":       fill_price,
+        "qty":         qty_total,
+        "qty_half":    qty_half,
+        "order_id":    order["orderId"],
+        "sl_order_id": sl_res.get("orderId")  if sl_ok  else None,
+        "tp1_order_id":tp1_res.get("orderId") if tp1_ok else None,
+        "tp2_order_id":tp2_res.get("orderId") if tp2_ok else None,
+        "opened_at":   datetime.utcnow().isoformat(),
     })
 
     dir_label = "🟢 LONG" if direction == "long" else "🔴 SHORT"
-    notional = qty * fill_price / DEFAULT_LEVERAGE
+    notional  = qty_total * fill_price / DEFAULT_LEVERAGE
+    daily_loss = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0)
+    limit_usdt = balance * DAILY_LOSS_LIMIT_PCT / 100
 
     await ctx.bot.send_message(
         chat_id,
         f"✅ *Позиция открыта!* {mode_label}\n\n"
         f"{dir_label} *{symbol.replace('USDT', '')}*\n"
         f"💵 Вход: `{fmt_price(fill_price)}`\n"
-        f"📦 Объём: `{qty}` (~`${notional:,.2f} USDT` маржи)\n"
-        f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n"
-        f"🛑 SL: `{fmt_price(sl)}` {sl_status}\n"
-        f"🎯 TP: `{fmt_price(tp1)}` {tp_status}\n\n"
+        f"📦 Объём: `{qty_total}` (~`${notional:,.2f} USDT` маржи)\n"
+        f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n\n"
+        f"🛑 SL (100%): `{fmt_price(sl)}` {'✅' if sl_ok else '⚠️ ' + _err(sl_res)}\n"
+        f"🎯 TP1 (50%): `{fmt_price(tp1)}` {'✅' if tp1_ok else '⚠️ ' + _err(tp1_res)}\n"
+        f"🎯 TP2 (50%): `{fmt_price(tp2)}` {'✅' if tp2_ok else '⚠️ ' + _err(tp2_res)}\n\n"
+        f"🛡 Дневной убыток: `${daily_loss:.2f}` / `${limit_usdt:.2f}`\n\n"
+        f"_50% позиции закроется на TP1, 50% — на TP2_\n"
         f"Используй `/autoportfolio` для отслеживания.\n"
         f"⚠️ _Торговля связана с риском потери средств._",
         parse_mode="Markdown"
@@ -2529,12 +2852,193 @@ async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
-    """Каждые 10 мин ищет сигналы для пользователей с активной автоторговлей.
-    Использует КОМБИНИРОВАННЫЙ счёт: старый quick_score (1H скан) +
-    все 5 стратегий (mean_reversion, trend_pullback, breakout,
-    divergence_swing, multitf_confirm на 1H+4H).
-    Сигнал отправляется только если оба источника согласны по направлению.
-    """
+    """Каждые 10 мин ищет сигналы. Комбинирует скан + 5 стратегий +
+    BTC-режим фильтр + Funding Rate (только экстремальные) + дневной лимит."""
+    import uuid
+    active_users = [cid for cid, on in AUTOTRADE_ENABLED.items() if on]
+    if not active_users:
+        return
+
+    # ── Получаем BTC режим один раз для всех ──────────────────────────────────
+    loop = asyncio.get_running_loop()
+    btc_trend = await loop.run_in_executor(None, get_btc_regime)
+    logger.info(f"autotrade_scan_job: BTC trend = {btc_trend}")
+
+    longs, shorts = await loop.run_in_executor(None, scan_market)
+    candidates = longs + shorts
+
+    for chat_id in active_users:
+        if chat_id not in USER_KEYS:
+            continue
+
+        keys    = USER_KEYS[chat_id]
+        balance = get_futures_balance(keys["api_key"], keys["api_secret"], chat_id=chat_id) or 0
+
+        # ── Дневной лимит убытков ─────────────────────────────────────────────
+        if not check_daily_loss_limit(chat_id, balance):
+            daily_loss = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0)
+            limit_usdt = balance * DAILY_LOSS_LIMIT_PCT / 100
+            logger.info(f"autotrade {chat_id}: дневной лимит ${daily_loss:.2f}/${limit_usdt:.2f} — пропускаем скан")
+            try:
+                await ctx.bot.send_message(
+                    chat_id,
+                    f"🛑 *Дневной лимит убытков достигнут* — автоторговля на паузе до UTC 00:00\n"
+                    f"Потеряно: `${daily_loss:.2f}` / лимит `${limit_usdt:.2f}`",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+            continue
+
+        open_symbols = {t["symbol"] for t in OPEN_AUTOTRADES.get(chat_id, [])}
+
+        for candidate in candidates:
+            symbol     = candidate["symbol"]
+            quick_score = candidate["score"]
+
+            if symbol in open_symbols:
+                continue
+            if abs(quick_score) < AUTOTRADE_SCORE_THRESHOLD:
+                continue
+
+            direction_quick = "long" if quick_score > 0 else "short"
+
+            # ── BTC режим: блокируем лонги по альтам при сильном даунтренде ──
+            if symbol != "BTCUSDT":
+                if direction_quick == "long" and btc_trend == "strong_down":
+                    logger.info(f"autotrade {symbol}: лонг заблокирован — BTC в strong_down")
+                    continue
+                if direction_quick == "short" and btc_trend == "strong_up":
+                    logger.info(f"autotrade {symbol}: шорт заблокирован — BTC в strong_up")
+                    continue
+
+            # ── Funding Rate (только экстремальные значения) ──────────────────
+            fr_pct, fr_signal = get_funding_signal(symbol)
+            fr_note = ""
+            if fr_signal is not None:
+                if fr_signal != direction_quick:
+                    # Funding явно против нашего направления — блокируем
+                    logger.info(
+                        f"autotrade {symbol}: funding {fr_pct:+.4f}% против направления {direction_quick} — пропускаем"
+                    )
+                    continue
+                else:
+                    # Funding подтверждает направление — бонус к счёту
+                    fr_note = f"⚡ Funding Rate экстремальный ({fr_pct:+.4f}%) подтверждает {direction_quick.upper()}"
+
+            # ── Детальный анализ 1H + 4H + все стратегии ─────────────────────
+            k1h = get_klines(symbol, "1h", 200)
+            k4h = get_klines(symbol, "4h", 200)
+            if not k1h:
+                continue
+
+            df1h = klines_to_df(k1h)
+            r1h  = full_analysis(df1h)
+            df4h = r4h = None
+            if k4h and len(k4h) >= 50:
+                df4h = klines_to_df(k4h)
+                r4h  = full_analysis(df4h)
+
+            strat_results, strat_total, tf_align = run_all_strategies(df1h, r1h, df4h, r4h)
+
+            mr_score,  _ = strat_results.get("mean_reversion",   (0, []))
+            tp_score,  _ = strat_results.get("trend_pullback",    (0, []))
+            bo_score,  _ = strat_results.get("breakout",          (0, []))
+            ds_score,  _ = strat_results.get("divergence_swing",  (0, []))
+            mtf_score, _ = strat_results.get("multitf",           (0, []))
+
+            combined   = quick_score * 1.0 + strat_total * 0.5
+            strat_dir  = "long" if strat_total > 0 else "short"
+
+            # Направления должны совпадать
+            if direction_quick != strat_dir:
+                logger.info(f"autotrade {symbol}: скан={direction_quick} vs стратегии={strat_dir} — не совпадают")
+                continue
+
+            if abs(combined) < AUTOTRADE_SCORE_THRESHOLD * 1.2:
+                continue
+
+            direction = direction_quick
+            price = df1h["close"].iloc[-1]
+            atr   = calc_atr(df1h, 14).iloc[-1]
+            risk  = atr * 1.5
+
+            if direction == "long":
+                sl, tp1, tp2 = price - risk, price + risk * 1.5, price + risk * 3.0
+                dir_label = "🟢 LONG"
+            else:
+                sl, tp1, tp2 = price + risk, price - risk * 1.5, price - risk * 3.0
+                dir_label = "🔴 SHORT"
+
+            strat_scores = [mr_score, tp_score, bo_score, ds_score, mtf_score]
+            agree_count  = sum(
+                1 for s in strat_scores
+                if (direction == "long" and s > 0) or (direction == "short" and s < 0)
+            )
+
+            trade_id = str(uuid.uuid4())[:8]
+            PENDING_TRADES[trade_id] = {
+                "symbol": symbol, "direction": direction,
+                "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
+                "score": combined,
+            }
+
+            risk_pct  = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
+            risk_usdt = balance * risk_pct / 100
+            mode      = USER_MODE.get(chat_id, "real")
+            mode_label = "🧪 DEMO" if mode == "demo" else "💰 REAL"
+
+            # BTC статус для карточки
+            btc_map = {
+                "strong_up": "🚀 Сильный рост", "up": "📈 Рост",
+                "strong_down": "💥 Сильное падение", "down": "📉 Падение", "neutral": "⚪ Боковик"
+            }
+            btc_note = f"BTC: {btc_map.get(btc_trend, btc_trend)}"
+            tf_note  = "✅ 1H и 4H совпадают" if tf_align else "⚠️ 1H/4H расходятся"
+
+            def strat_line(name, sc):
+                if (direction == "long" and sc > 0) or (direction == "short" and sc < 0):
+                    return f"  ✅ {name}: `{sc:+.1f}`"
+                elif sc == 0:
+                    return f"  ⚪ {name}: нейтрально"
+                return f"  ❌ {name}: `{sc:+.1f}` (против)"
+
+            daily_loss = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0)
+            limit_usdt = balance * DAILY_LOSS_LIMIT_PCT / 100
+
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"✅ Войти (~${risk_usdt:.0f} риск)", callback_data=f"trade_confirm:{trade_id}"),
+                InlineKeyboardButton("❌ Отмена", callback_data=f"trade_cancel:{trade_id}"),
+            ]])
+
+            text = (
+                f"🤖 *Авто-сигнал: {dir_label}* {mode_label}\n\n"
+                f"💎 *{symbol.replace('USDT', '')}*  |  `{fmt_price(price)}`\n"
+                f"📊 Скан: `{quick_score:+.1f}` | Стратегии: `{strat_total:+.1f}` | Итого: `{combined:+.1f}`\n"
+                f"🔢 Согласны {agree_count}/5 стратегий\n\n"
+                f"*📋 Стратегии:*\n"
+                f"{strat_line('Mean Reversion', mr_score)}\n"
+                f"{strat_line('Trend Pullback', tp_score)}\n"
+                f"{strat_line('Breakout      ', bo_score)}\n"
+                f"{strat_line('Div. Swing    ', ds_score)}\n"
+                f"{strat_line('MultiTF 1H+4H ', mtf_score)}\n\n"
+                f"📐 {tf_note}  |  {btc_note}\n"
+                + (f"⚡ {fr_note}\n" if fr_note else "") +
+                f"\n🛑 SL: `{fmt_price(sl)}`\n"
+                f"🎯 TP1 (50%): `{fmt_price(tp1)}`\n"
+                f"🎯 TP2 (50%): `{fmt_price(tp2)}`\n"
+                f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n"
+                f"💰 Риск: `~${risk_usdt:.2f}` ({risk_pct}%)\n"
+                f"🛡 Дн. убыток: `${daily_loss:.2f}` / `${limit_usdt:.2f}`\n\n"
+                f"⏳ _Актуально ~15 минут_"
+            )
+
+            try:
+                await ctx.bot.send_message(chat_id=chat_id, text=text,
+                                           parse_mode="Markdown", reply_markup=kb)
+                break
+            except Exception as e:
+                logger.warning(f"autotrade_scan_job {chat_id}: {e}")
     import uuid
     active_users = [cid for cid, on in AUTOTRADE_ENABLED.items() if on]
     if not active_users:
