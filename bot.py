@@ -58,11 +58,6 @@ AUTOTRADE_PAUSED:     dict[int, bool] = {}   # chat_id -> пауза из-за �
 # ─── BTC режим (кэш) ─────────────────────────────────────────────────────────
 _BTC_TREND_CACHE: dict = {"trend": None, "updated_at": 0}  # обновляем раз в 30 мин
 
-# ─── Дневной лимит убытков ────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT = 5.0                   # максимальный дневной убыток в % от баланса
-AUTOTRADE_DAILY_LOSS: dict[int, float] = {}  # chat_id -> сумма убытков за сегодня ($)
-AUTOTRADE_DAILY_DATE: dict[int, str]  = {}   # chat_id -> дата последнего сброса
-
 # ─── Funding Rate пороги (только экстремальные значения) ──────────────────────
 FUNDING_EXTREME_HIGH =  0.10   # % — рынок перегрет лонгами → шорт-сигнал
 FUNDING_EXTREME_LOW  = -0.05   # % — рынок перегрет шортами → лонг-сигнал
@@ -160,25 +155,46 @@ def get_funding_signal(symbol: str) -> tuple[float, str | None]:
         return 0.0, None
 
 
-def check_daily_loss_limit(chat_id: int, balance: float) -> bool:
+def check_daily_loss_limit(chat_id: int, balance: float) -> tuple[bool, str]:
     """
-    Возвращает True если дневной лимит убытков НЕ превышен (можно торговать).
-    Сбрасывает счётчик если наступил новый день.
+    Проверяет не превышен ли дневной лимит убытков.
+    Возвращает (торговля_разрешена, сообщение).
+    """
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # Сброс счётчика в новый день
+    if AUTOTRADE_DAILY_DATE.get(chat_id) != today:
+        AUTOTRADE_DAILY_DATE[chat_id] = today
+        AUTOTRADE_DAILY_LOSS[chat_id] = 0.0
+        AUTOTRADE_PAUSED[chat_id] = False
+
+    if AUTOTRADE_PAUSED.get(chat_id, False):
+        loss = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0)
+        limit = balance * DAILY_LOSS_LIMIT_PCT / 100
+        return False, (
+            f"🛑 Автоторговля приостановлена на сегодня\n"
+            f"Дневной убыток: `${loss:.2f}` / лимит `${limit:.2f}` ({DAILY_LOSS_LIMIT_PCT}%)\n"
+            f"Возобновится завтра автоматически."
+        )
+    return True, ""
+
+
+def record_trade_result(chat_id: int, pnl_usd: float, balance: float):
+    """
+    Записывает результат сделки. Если убыток превысил дневной лимит — ставит паузу.
     """
     today = datetime.utcnow().strftime("%Y-%m-%d")
     if AUTOTRADE_DAILY_DATE.get(chat_id) != today:
-        AUTOTRADE_DAILY_LOSS[chat_id] = 0.0
         AUTOTRADE_DAILY_DATE[chat_id] = today
+        AUTOTRADE_DAILY_LOSS[chat_id] = 0.0
 
-    daily_loss = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0)
-    limit_usdt = balance * DAILY_LOSS_LIMIT_PCT / 100
-    return daily_loss < limit_usdt
+    if pnl_usd < 0:
+        AUTOTRADE_DAILY_LOSS[chat_id] = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0) + abs(pnl_usd)
 
-
-def record_trade_pnl(chat_id: int, pnl_usdt: float):
-    """Записывает PnL сделки в дневной счётчик убытков."""
-    if pnl_usdt < 0:
-        AUTOTRADE_DAILY_LOSS[chat_id] = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0) + abs(pnl_usdt)
+    limit = balance * DAILY_LOSS_LIMIT_PCT / 100
+    if AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0) >= limit:
+        AUTOTRADE_PAUSED[chat_id] = True
+        logger.warning(f"chat_id={chat_id}: дневной лимит убытков достигнут, автоторговля приостановлена")
 
 
 def get_ticker_24h(symbol):
@@ -2401,9 +2417,8 @@ def get_futures_balance(api_key, api_secret, chat_id=None):
             r = requests.get(f"{DEMO_FUTURES_API}/fapi/v3/balance", params=params, headers=headers, timeout=10)
             data = r.json()
             if isinstance(data, list):
-                for asset in data:
-                    if asset.get("asset") == "USDT":
-                        return float(asset["availableBalance"])
+                total = sum(float(a["availableBalance"]) for a in data if a.get("asset") in ("USDT", "USDC"))
+                return total if total > 0 else None
         except Exception as e:
             logger.warning(f"get_futures_balance demo: {e}")
         return None
@@ -2411,10 +2426,8 @@ def get_futures_balance(api_key, api_secret, chat_id=None):
     data = futures_signed_request("GET", "fapi/v3/account", api_key, api_secret, chat_id=chat_id)
     if not data or "assets" not in data:
         return None
-    for asset in data["assets"]:
-        if asset["asset"] == "USDT":
-            return float(asset["availableBalance"])
-    return None
+    total = sum(float(a["availableBalance"]) for a in data["assets"] if a["asset"] in ("USDT", "USDC"))
+    return total if total > 0 else None
 
 
 def get_symbol_info(symbol, chat_id=None):
@@ -2557,18 +2570,9 @@ async def execute_trade(chat_id, trade_info, ctx):
         return
 
     # ── Проверка дневного лимита убытков ──────────────────────────────────────
-    if not check_daily_loss_limit(chat_id, balance):
-        daily_loss = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0)
-        limit_usdt = balance * DAILY_LOSS_LIMIT_PCT / 100
-        await ctx.bot.send_message(
-            chat_id,
-            f"🛑 *Дневной лимит убытков достигнут*\n\n"
-            f"Потеряно сегодня: `${daily_loss:.2f}`\n"
-            f"Лимит: `${limit_usdt:.2f}` ({DAILY_LOSS_LIMIT_PCT}% баланса)\n\n"
-            f"Автоторговля приостановлена до UTC 00:00.\n"
-            f"_Это защита депозита — не отключай её._",
-            parse_mode="Markdown"
-        )
+    allowed, pause_msg = check_daily_loss_limit(chat_id, balance)
+    if not allowed:
+        await ctx.bot.send_message(chat_id, f"🛑 *Дневной лимит убытков*\n\n{pause_msg}", parse_mode="Markdown")
         return
 
     risk_pct  = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
@@ -2616,34 +2620,59 @@ async def execute_trade(chat_id, trade_info, ctx):
     if not position_confirmed:
         logger.warning(f"execute_trade {symbol}: позиция не подтвердилась за 5 попыток")
 
-    # ── SL на полный объём ───────────────────────────────────────────────────
-    sl_res, _ = await loop.run_in_executor(
-        None, place_sl_tp_orders, symbol, direction, sl, tp1, qty_total,
-        price_precision, qty_precision, keys["api_key"], keys["api_secret"], chat_id
-    )
-
-    # ── TP1 на 50% объёма ────────────────────────────────────────────────────
+    # ── SL + TP1 + TP2 с retry ───────────────────────────────────────────────
     close_side = "SELL" if direction == "long" else "BUY"
-    tp1_params = {
+
+    def _place_with_retry(params_base, label, attempts=4, delay=1.5):
+        """Каждая попытка генерирует свежий timestamp — именно это исправляет
+        'Signature for this request is not valid' при повторных вызовах."""
+        last_res = None
+        for attempt in range(1, attempts + 1):
+            params = dict(params_base)
+            params["timestamp"]  = int(time.time() * 1000)
+            params["recvWindow"] = 5000
+            qs  = "&".join(f"{k}={v}" for k, v in params.items())
+            sig = hmac.new(keys["api_secret"].encode(), qs.encode(), hashlib.sha256).hexdigest()
+            params["signature"] = sig
+            headers = {"X-MBX-APIKEY": keys["api_key"]}
+            base_url = get_futures_api(chat_id)
+            try:
+                r = requests.post(f"{base_url}/fapi/v1/order",
+                                  params=params, headers=headers, timeout=10)
+                data = r.json()
+                if "orderId" in data:
+                    return data
+                last_res = data
+                logger.warning(f"{label} попытка {attempt}/{attempts}: {data}")
+            except Exception as e:
+                last_res = {"msg": str(e)}
+                logger.warning(f"{label} попытка {attempt}/{attempts} исключение: {e}")
+            if attempt < attempts:
+                time.sleep(delay)
+        return last_res
+
+    sl_base = {
+        "symbol": symbol, "side": close_side, "type": "STOP_MARKET",
+        "quantity": round(qty_total, qty_precision),
+        "stopPrice": round(sl, price_precision),
+        "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
+    }
+    tp1_base = {
         "symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
         "quantity": round(qty_half, qty_precision),
         "stopPrice": round(tp1, price_precision),
         "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
     }
-    tp1_res = futures_signed_request(
-        "POST", "fapi/v1/order", keys["api_key"], keys["api_secret"], tp1_params, chat_id=chat_id
-    )
-
-    # ── TP2 на оставшиеся 50% ────────────────────────────────────────────────
-    tp2_params = {
+    tp2_base = {
         "symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
         "quantity": round(qty_half, qty_precision),
         "stopPrice": round(tp2, price_precision),
         "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
     }
-    tp2_res = futures_signed_request(
-        "POST", "fapi/v1/order", keys["api_key"], keys["api_secret"], tp2_params, chat_id=chat_id
-    )
+
+    sl_res  = await loop.run_in_executor(None, _place_with_retry, sl_base,  f"SL  {symbol}")
+    tp1_res = await loop.run_in_executor(None, _place_with_retry, tp1_base, f"TP1 {symbol}")
+    tp2_res = await loop.run_in_executor(None, _place_with_retry, tp2_base, f"TP2 {symbol}")
 
     sl_ok  = sl_res  and "orderId" in sl_res
     tp1_ok = tp1_res and "orderId" in tp1_res
@@ -2911,17 +2940,12 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
         balance = get_futures_balance(keys["api_key"], keys["api_secret"], chat_id=chat_id) or 0
 
         # ── Дневной лимит убытков ─────────────────────────────────────────────
-        if not check_daily_loss_limit(chat_id, balance):
-            daily_loss = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0)
-            limit_usdt = balance * DAILY_LOSS_LIMIT_PCT / 100
-            logger.info(f"autotrade {chat_id}: дневной лимит ${daily_loss:.2f}/${limit_usdt:.2f} — пропускаем скан")
+        allowed, pause_msg = check_daily_loss_limit(chat_id, balance)
+        if not allowed:
+            logger.info(f"autotrade {chat_id}: дневной лимит — пропускаем скан")
             try:
-                await ctx.bot.send_message(
-                    chat_id,
-                    f"🛑 *Дневной лимит убытков достигнут* — автоторговля на паузе до UTC 00:00\n"
-                    f"Потеряно: `${daily_loss:.2f}` / лимит `${limit_usdt:.2f}`",
-                    parse_mode="Markdown"
-                )
+                await ctx.bot.send_message(chat_id, f"🛑 *Дневной лимит убытков*\n\n{pause_msg}",
+                                           parse_mode="Markdown")
             except Exception:
                 pass
             continue
