@@ -48,6 +48,7 @@ PENDING_TRADES: dict[str, dict] = {}          # trade_id -> данные сде�
 OPEN_AUTOTRADES: dict[int, list] = {}         # chat_id -> список открытых авто-позиций
 AUTOTRADE_SCORE_THRESHOLD = 5.0              # порог сигнала
 DEFAULT_LEVERAGE = 3                          # плечо по умолчанию
+PENDING_TRADE_TTL_SEC = 1800                  # сколько живёт неподтверждённый авто-сигнал (30 мин)
 
 # ─── Дневной лимит убытков ────────────────────────────────────────────────────
 DAILY_LOSS_LIMIT_PCT = 5.0                   # максимальный дневной убыток в % от баланса
@@ -315,82 +316,6 @@ def btc_regime_allows(direction: str) -> tuple[bool, str]:
     if direction == "short" and trend == "strong_up":
         return False, f"❌ Шорт заблокирован: {label}"
     return True, f"✅ BTC режим: {label}"
-
-
-# ─── Funding Rate фильтр ──────────────────────────────────────────────────────
-
-FUNDING_EXTREME_LONG  =  0.10   # % — рынок перегрет лонгами → шорт-сигнал
-FUNDING_EXTREME_SHORT = -0.05   # % — рынок перегрет шортами → лонг-сигнал
-
-def get_funding_signal(symbol: str) -> tuple[float, str]:
-    """
-    Возвращает (score_delta, описание).
-    Работает ТОЛЬКО при экстремальных значениях funding rate.
-    В обычное время возвращает (0, "").
-    """
-    data = get_funding_rate(symbol)
-    if not data or "lastFundingRate" not in data:
-        return 0.0, ""
-
-    fr = float(data["lastFundingRate"]) * 100  # переводим в %
-
-    if fr >= FUNDING_EXTREME_LONG:
-        # Рынок перегрет лонгами — сигнал к шорту
-        intensity = min((fr - FUNDING_EXTREME_LONG) / 0.05, 2.0)
-        score = -(1.0 + intensity)
-        return round(score, 2), f"⚠️ Funding ЭКСТРЕМАЛЬНЫЙ ({fr:+.3f}%) — перегрев лонгов, шорт-давление"
-
-    if fr <= FUNDING_EXTREME_SHORT:
-        # Рынок перегрет шортами — сигнал к лонгу
-        intensity = min((abs(fr) - abs(FUNDING_EXTREME_SHORT)) / 0.03, 2.0)
-        score = 1.0 + intensity
-        return round(score, 2), f"⚠️ Funding ЭКСТРЕМАЛЬНЫЙ ({fr:+.3f}%) — перегрев шортов, лонг-давление"
-
-    return 0.0, ""  # обычный диапазон — игнорируем
-
-
-# ─── Дневной лимит убытков ────────────────────────────────────────────────────
-
-def check_daily_loss_limit(chat_id: int, balance: float) -> tuple[bool, str]:
-    """
-    Проверяет не превышен ли дневной лимит убытков.
-    Возвращает (торговля_разрешена, сообщение).
-    """
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-
-    # Сброс счётчика в новый день
-    if AUTOTRADE_DAILY_DATE.get(chat_id) != today:
-        AUTOTRADE_DAILY_DATE[chat_id] = today
-        AUTOTRADE_DAILY_LOSS[chat_id] = 0.0
-        AUTOTRADE_PAUSED[chat_id] = False
-
-    if AUTOTRADE_PAUSED.get(chat_id, False):
-        loss = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0)
-        limit = balance * DAILY_LOSS_LIMIT_PCT / 100
-        return False, (
-            f"🛑 Автоторговля приостановлена на сегодня\n"
-            f"Дневной убыток: `${loss:.2f}` / лимит `${limit:.2f}` ({DAILY_LOSS_LIMIT_PCT}%)\n"
-            f"Возобновится завтра автоматически."
-        )
-    return True, ""
-
-
-def record_trade_result(chat_id: int, pnl_usd: float, balance: float):
-    """
-    Записывает результат сделки. Если убыток превысил дневной лимит — ставит паузу.
-    """
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    if AUTOTRADE_DAILY_DATE.get(chat_id) != today:
-        AUTOTRADE_DAILY_DATE[chat_id] = today
-        AUTOTRADE_DAILY_LOSS[chat_id] = 0.0
-
-    if pnl_usd < 0:
-        AUTOTRADE_DAILY_LOSS[chat_id] = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0) + abs(pnl_usd)
-
-    limit = balance * DAILY_LOSS_LIMIT_PCT / 100
-    if AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0) >= limit:
-        AUTOTRADE_PAUSED[chat_id] = True
-        logger.warning(f"chat_id={chat_id}: дневной лимит убытков достигнут, автоторговля приостановлена")
 
 
 # ─── Частичное закрытие позиции ───────────────────────────────────────────────
@@ -2500,6 +2425,118 @@ def get_open_position_amt(symbol, api_key, api_secret, chat_id=None):
     return None
 
 
+def get_open_positions_map(api_key, api_secret, chat_id=None):
+    """Возвращает {symbol: positionAmt} по всем открытым фьючерсным позициям.
+    Один запрос вместо N — дешевле по rate limit, чем get_open_position_amt на символ."""
+    data = futures_signed_request("GET", "fapi/v3/account", api_key, api_secret, chat_id=chat_id)
+    if not data or "positions" not in data:
+        return {}
+    out = {}
+    for p in data["positions"]:
+        try:
+            amt = float(p.get("positionAmt", 0))
+        except (TypeError, ValueError):
+            continue
+        if amt != 0:
+            out[p["symbol"]] = amt
+    return out
+
+
+def get_realized_pnl(api_key, api_secret, symbol, start_ts_ms, chat_id=None):
+    """Сумма реализованного PnL по закрытым сделкам по символу с момента start_ts_ms.
+    Эндпоинт fapi/v1/userTrades отдаёт каждую закрытую часть позиции с realisedPnl.
+    Используется для дневного лимита убытков: если позиция закрылась (SL/TP на бирже),
+    бот об этом не узнаёт сам — поэтому polled-им историю сделок."""
+    total = 0.0
+    has_data = False
+    try:
+        data = futures_signed_request(
+            "GET", "fapi/v1/userTrades", api_key, api_secret,
+            {"symbol": symbol, "startTime": start_ts_ms, "limit": 1000},
+            chat_id=chat_id,
+        )
+        if isinstance(data, list):
+            for t in data:
+                try:
+                    pnl = float(t.get("realizedPnl", 0))
+                    commission = float(t.get("commission", 0))
+                except (TypeError, ValueError):
+                    continue
+                if pnl != 0:  # buyer=False записи закрытия позиции
+                    total += pnl - commission
+                    has_data = True
+    except Exception as e:
+        logger.warning(f"get_realized_pnl {symbol}: {e}")
+    return total if has_data else None
+
+
+def sync_open_autotrades(chat_id, api_key, api_secret):
+    """Синхронизирует локальный OPEN_AUTOTRADES с реальными позициями биржи:
+      - убирает закрытые на бирже позиции (и фиксирует их PnL в дневной лимит);
+      - не трогает те, что ещё открыты.
+    Без этого список рос бесконечно: SL/TP срабатывают на бирже, а бот об этом не знал."""
+    trades = OPEN_AUTOTRADES.get(chat_id)
+    if not trades:
+        return
+
+    live_positions = get_open_positions_map(api_key, api_secret, chat_id=chat_id)
+    if not live_positions:
+        # Запрос упал (None/пусто) — не доверяем, лучше ничего не удалять в этом цикле,
+        # чем удалить реально открытую позицию. Пропускаем синхронизацию.
+        return
+
+    keys = USER_KEYS.get(chat_id)
+    balance = 0.0
+    if keys:
+        balance = get_futures_balance(keys["api_key"], keys["api_secret"], chat_id=chat_id) or 0.0
+
+    # Граница дня по UTC — чтобы запросить PnL только за сегодня.
+    now = datetime.utcnow()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_start_ms = int(day_start.timestamp() * 1000)
+
+    still_open = []
+    closed_pnl_total = 0.0
+    for t in trades:
+        symbol = t.get("symbol")
+        if symbol and symbol in live_positions:
+            still_open.append(t)  # позиция ещё жива на бирже
+        else:
+            # Позиция закрылась на бирже — узнаём её реализованный PnL за сегодня.
+            pnl = get_realized_pnl(api_key, api_secret, symbol, day_start_ms, chat_id=chat_id)
+            if pnl is None:
+                # Историю не получили — оставляем запись, разберёмся в следующем цикле,
+                # чтобы не потерять убыточную сделку из подсчёта лимита.
+                still_open.append(t)
+                logger.warning(f"sync_open_autotrades {chat_id} {symbol}: не удалось получить PnL, оставляю запись")
+                continue
+            closed_pnl_total += pnl
+            logger.info(f"sync_open_autotrades {chat_id} {symbol}: закрыта, PnL={pnl:+.2f} USDT")
+
+    OPEN_AUTOTRADES[chat_id] = still_open
+
+    # Фиксируем суммарный PnL всех закрывшихся в этом цикле позиций в дневной лимит.
+    if closed_pnl_total != 0.0:
+        record_trade_result(chat_id, closed_pnl_total, balance)
+
+
+def cleanup_pending_trades(now_ts=None):
+    """Удаляет неподтверждённые авто-сигналы старше PENDING_TRADE_TTL_SEC.
+    Карточка в Telegram остаётся, но callback уже вернёт 'сигнал устарел'.
+    Без этого PENDING_TRADES рос бесконечно при долгом аптайме."""
+    if not PENDING_TRADES:
+        return
+    now_ts = now_ts if now_ts is not None else time.time()
+    expired = [
+        tid for tid, t in PENDING_TRADES.items()
+        if now_ts - t.get("created_at", now_ts) > PENDING_TRADE_TTL_SEC
+    ]
+    for tid in expired:
+        PENDING_TRADES.pop(tid, None)
+    if expired:
+        logger.info(f"cleanup_pending_trades: удалено {len(expired)} устаревших сигналов")
+
+
 def place_futures_market_order(symbol, side, quantity, qty_precision, api_key, api_secret, chat_id=None):
     """Открывает рыночный ордер на фьючерсах."""
     qty = round(quantity, qty_precision)
@@ -2932,11 +2969,27 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
     longs, shorts = await loop.run_in_executor(None, scan_market)
     candidates = longs + shorts
 
+    # Чистим устаревшие неподтверждённые авто-сигналы (иначе PENDING_TRADES
+    # растёт бесконечно при долгом аптайме — карточка остаётся, но callback
+    # уже вернёт «сигнал устарел»).
+    cleanup_pending_trades()
+
     for chat_id in active_users:
         if chat_id not in USER_KEYS:
             continue
 
         keys    = USER_KEYS[chat_id]
+        balance = get_futures_balance(keys["api_key"], keys["api_secret"], chat_id=chat_id) or 0
+
+        # ── Синхронизация локальных позиций с биржей ─────────────────────────
+        # SL/TP срабатывают на бирже сами, бот об этом не знает — без этой
+        # проверки OPEN_AUTOTRADES[chat_id] рос бесконечно, и символы, по
+        # которым позиция уже закрылась, навсегда блокировали новые входы.
+        # Заодно зафиксируем реализованный PnL закрывшихся сделок в дневной лимит.
+        await loop.run_in_executor(
+            None, sync_open_autotrades, chat_id, keys["api_key"], keys["api_secret"]
+        )
+        # Баланс мог измениться после учёта закрытых позиций — перечитываем.
         balance = get_futures_balance(keys["api_key"], keys["api_secret"], chat_id=chat_id) or 0
 
         # ── Дневной лимит убытков ─────────────────────────────────────────────
@@ -3080,6 +3133,7 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
             "symbol": symbol, "direction": direction,
             "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
             "score": combined,
+            "created_at": time.time(),
         }
 
         risk_pct  = AUTOTRADE_RISK_PCT.get(chat_id, 1.0)
