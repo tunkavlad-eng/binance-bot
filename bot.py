@@ -48,6 +48,12 @@ PENDING_TRADES: dict[str, dict] = {}          # trade_id -> данные сде�
 OPEN_AUTOTRADES: dict[int, list] = {}         # chat_id -> список открытых авто-позиций
 AUTOTRADE_SCORE_THRESHOLD = 5.0              # порог сигнала
 DEFAULT_LEVERAGE = 3                          # плечо по умолчанию
+MAX_CANDIDATES_LONG  = 8                      # сколько лонг-кандидатов отдаёт сканер в авто-анализ
+MAX_CANDIDATES_SHORT = 8                      # сколько шорт-кандидатов отдаёт сканер
+ATR_SL_MULT      = 1.5                        # базовый множитель ATR для стоп-лосса
+ATR_SL_CAP_MULT  = 2.5                        # верхняя граница SL по структуре, в ATR
+ATR_SL_LOOKBACK  = 20                         # глубина поиска swing-high/low для SL по структуре
+ATR_TRAIL_MULT   = 1.0                        # дистанция трейлинг-стопа после TP1, в ATR
 PENDING_TRADE_TTL_SEC = 1800                  # сколько живёт неподтверждённый авто-сигнал (30 мин)
 
 # ─── Дневной лимит убытков ────────────────────────────────────────────────────
@@ -206,13 +212,43 @@ def get_ticker_24h(symbol):
     except:
         return None
 
+def _binance_get_with_retry(url, params=None, timeout=10, max_retries=3):
+    """GET-запрос к Binance с exponential backoff на 429/418.
+    - 429 (rate limit) и 418 (IP-бан) — пауза 1→2→4с и ретрай, а не молчаливый None.
+    - 5xx — тоже ретрай (кратковременные сбои нод).
+    - остальные ошибки/таймауты — сразу None, как раньше.
+    Без этого тяжёлый сканер мог получить 429 и тихо пропустить данные → битые
+    свечи → ложные сигналы."""
+    delay = 1.0
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code in (429, 418) or r.status_code >= 500:
+                logger.warning(f"binance GET {url} status={r.status_code} — retry через {delay}s (попытка {attempt+1}/{max_retries})")
+                if r.status_code == 418:
+                    # IP-бан: Binance просит длинную паузу. Уважаем.
+                    delay *= 4
+                time.sleep(delay)
+                delay *= 2
+                continue
+            r.raise_for_status()
+            return r.json()
+        except (requests.Timeout, requests.ConnectionError) as e:
+            logger.warning(f"binance GET {url} network: {e} — retry через {delay}s (попытка {attempt+1}/{max_retries})")
+            time.sleep(delay)
+            delay *= 2
+            continue
+        except Exception as e:
+            logger.warning(f"binance GET {url}: {e}")
+            return None
+    return None
+
+
 def get_klines(symbol, interval="1h", limit=200):
-    try:
-        r = requests.get(f"{BINANCE_API}/klines", params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except:
-        return None
+    return _binance_get_with_retry(
+        f"{BINANCE_API}/klines",
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+    )
 
 def get_futures_ticker(symbol):
     try:
@@ -401,6 +437,54 @@ def calc_atr(df, period=14):
         (low - prev_close).abs(),
     ], axis=1).max(axis=1)
     return tr.rolling(period).mean()
+
+
+def calc_structural_sl(price, atr, direction, df, lookback=ATR_SL_LOOKBACK):
+    """Стоп-лосс с учётом структуры рынка, а не голого ATR.
+
+    Логика (для лонга):
+      - базовый SL = price - ATR*ATR_SL_MULT (как раньше);
+      - ищем ближайший swing-low за последние `lookback` баров — уровень,
+        ниже которого логично признать сценарий сломанным;
+      - если swing-low лежит ВНУТРИ ATR-диапазона (ближе к цене), берём его —
+        стоп получается tighter, меньше выбивает шумом;
+      - ограничиваем снизу: SL не дальше price - ATR*ATR_SL_CAP_MULT, чтобы
+        слишком «глубокий» swing не раздувал риск сверх меры.
+    Для шорта — зеркально (по swing-high).
+
+    Возвращает (sl_price, r_distance) где r_distance = |price - sl| —
+    фактический риск на инструмент, из него далее считаются TP1/TP2 (R:R 1.5 / 3.0).
+    """
+    base_risk = atr * ATR_SL_MULT
+    max_risk = atr * ATR_SL_CAP_MULT
+
+    window = df.tail(lookback)
+    try:
+        if direction == "long":
+            swing = float(window["low"].min())
+            sl_atr = price - base_risk
+            sl_cap = price - max_risk
+            # swing должен быть МЕЖДУ cap и ценой входа; берём ближайший к цене из (sl_atr, swing)
+            if sl_cap < swing < price:
+                sl = max(sl_atr, swing)  # tighter стоп → max() поднимает SL ближе к цене
+            else:
+                sl = sl_atr
+        else:  # short
+            swing = float(window["high"].max())
+            sl_atr = price + base_risk
+            sl_cap = price + max_risk
+            if price < swing < sl_cap:
+                sl = min(sl_atr, swing)
+            else:
+                sl = sl_atr
+    except Exception:
+        sl = price - base_risk if direction == "long" else price + base_risk
+
+    risk = abs(price - sl)
+    if risk <= 0:
+        risk = base_risk
+        sl = price - base_risk if direction == "long" else price + base_risk
+    return sl, risk
 
 def detect_candle_patterns(df):
     patterns = []
@@ -1391,8 +1475,8 @@ def scan_market(min_volume=5_000_000, max_symbols=60, max_workers=8):
             time.sleep(0.02)  # небольшая пауза, чтобы не упереться в rate limit
 
     results.sort(key=lambda x: x["score"], reverse=True)
-    longs = [r for r in results if r["score"] > 1.5][:5]
-    shorts = sorted([r for r in results if r["score"] < -1.5], key=lambda x: x["score"])[:5]
+    longs  = [r for r in results if r["score"] > 1.5][:MAX_CANDIDATES_LONG]
+    shorts = sorted([r for r in results if r["score"] < -1.5], key=lambda x: x["score"])[:MAX_CANDIDATES_SHORT]
     return longs, shorts
 
 
@@ -1704,7 +1788,16 @@ async def strategy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     current_price = df1h["close"].iloc[-1]
     atr = calc_atr(df1h, 14).iloc[-1]
-    risk = atr * 1.5
+    # SL/TP теперь считаются по структуре (см. calc_structural_sl) — tighter стоп,
+    # меньше выбивает шумом. Здесь direction определяем по знаку total_score,
+    # т.к. /analyze показывает и нейтральные сигналы (где SL/TP не нужны).
+    if total_score > 0:
+        sl, risk = calc_structural_sl(current_price, atr, "long", df1h)
+    elif total_score < 0:
+        sl, risk = calc_structural_sl(current_price, atr, "short", df1h)
+    else:
+        sl = tp1 = tp2 = None
+        risk = atr * 1.5  # только для отображения ATR-эквивалента
 
     # Итоговый сигнал
     if total_score >= 8:
@@ -1718,13 +1811,11 @@ async def strategy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         final_signal, final_emoji = "⚪ НЕЙТРАЛЬНО", "⏸"
 
-    # SL/TP на основе ATR
+    # SL/TP на основе структуры (рассчитано выше через calc_structural_sl)
     if "ЛОНГ" in final_signal:
-        sl  = current_price - risk
         tp1 = current_price + risk * 1.5
         tp2 = current_price + risk * 3.0
     elif "ШОРТ" in final_signal:
-        sl  = current_price + risk
         tp1 = current_price - risk * 1.5
         tp2 = current_price - risk * 3.0
     else:
@@ -2537,6 +2628,161 @@ def cleanup_pending_trades(now_ts=None):
         logger.info(f"cleanup_pending_trades: удалено {len(expired)} устаревших сигналов")
 
 
+def _move_sl_order(symbol, old_order_id, new_sl_price, close_side, qty, qty_precision,
+                   price_precision, api_key, api_secret, chat_id=None):
+    """Переставляет SL-ордер: отменяет старый, ставит новый STOP_MARKET на new_sl_price.
+    Возвращает (ok: bool, new_order_id). Если отмена/установка упали — возвращает (False, None),
+    старый ордер при этом мог остаться висеть (это безопаснее, чем остаться без стопа)."""
+    base_url = get_futures_api(chat_id)
+
+    def _cancel(oid):
+        params = {"symbol": symbol, "orderId": oid,
+                  "timestamp": int(time.time() * 1000), "recvWindow": 5000}
+        qs = "&".join(f"{k}={v}" for k, v in params.items())
+        params["signature"] = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+        try:
+            requests.delete(f"{base_url}/fapi/v1/order",
+                            params=params, headers={"X-MBX-APIKEY": api_key}, timeout=10)
+        except Exception as e:
+            logger.warning(f"_move_sl_order cancel {symbol} oid={oid}: {e}")
+
+    def _place():
+        params = {
+            "symbol": symbol, "side": close_side, "type": "STOP_MARKET",
+            "quantity": round(qty, qty_precision),
+            "stopPrice": round(new_sl_price, price_precision),
+            "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
+            "timestamp": int(time.time() * 1000), "recvWindow": 5000,
+        }
+        qs = "&".join(f"{k}={v}" for k, v in params.items())
+        params["signature"] = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+        r = requests.post(f"{base_url}/fapi/v1/order",
+                          params=params, headers={"X-MBX-APIKEY": api_key}, timeout=10)
+        return r.json()
+
+    if old_order_id:
+        _cancel(old_order_id)
+
+    # Небольшой retry на постановку нового — биржа иногда 429'ит.
+    for attempt in range(3):
+        try:
+            data = _place()
+            if "orderId" in data:
+                return True, data["orderId"]
+            logger.warning(f"_move_sl_order place {symbol} попытка {attempt+1}: {data}")
+        except Exception as e:
+            logger.warning(f"_move_sl_order place {symbol} попытка {attempt+1}: {e}")
+        time.sleep(1.0)
+    return False, None
+
+
+def trailing_stop_manage_one(trade, api_key, api_secret, chat_id):
+    """Обрабатывает одну позицию из OPEN_AUTOTRADES:
+       1) если TP1 ещё не сработал — ничего не делаем;
+       2) когда TP1 сработал (позиция уменьшилась до ~qty_half) — переставляем SL на б/у;
+       3) после б/у — трейлим SL за ценой на ATR_TRAIL_MULT × ATR.
+    Возвращает обновлённый trade (или None, если позиция исчезла с биржи — её уберёт
+    sync_open_autotrades). Все сетевые вызовы идут синхронно — функцию дёргают через
+    run_in_executor, чтобы не блокировать event loop."""
+    symbol = trade.get("symbol")
+    direction = trade.get("direction") or ("long" if trade.get("qty", 0) > 0 else "short")
+    entry = trade.get("entry")
+    if not symbol or entry is None:
+        return trade
+
+    pos_amt = get_open_position_amt(symbol, api_key, api_secret, chat_id=chat_id)
+    if pos_amt is None or abs(pos_amt) < 1e-9:
+        # Позиция закрылась целиком — sync_open_autotrades её уберёт, тут только выходим.
+        return None
+    if abs(pos_amt) > abs(trade.get("qty", 0)) * 0.75 and not trade.get("tp1_filled"):
+        # TP1 ещё не сработал — позиция ещё полного размера, трейлинг рано.
+        return trade
+
+    close_side = "SELL" if direction == "long" else "BUY"
+
+    # Шаг 1: первый раз замечаем, что TP1 сработал → переводим SL на безубыток.
+    if not trade.get("be_set"):
+        be_buffer = trade.get("atr_at_open", 0) * 0.15  # небольшой буфер поверх entry
+        if direction == "long":
+            new_sl = entry + be_buffer
+        else:
+            new_sl = entry - be_buffer
+        ok, new_oid = _move_sl_order(
+            symbol, trade.get("sl_order_id"), new_sl, close_side,
+            abs(pos_amt), trade.get("qty_precision", 3), trade.get("price_precision", 2),
+            api_key, api_secret, chat_id=chat_id,
+        )
+        if ok:
+            trade["sl_order_id"] = new_oid
+            trade["be_set"] = True
+            trade["trail_sl"] = new_sl
+            trade["tp1_filled"] = True
+            logger.info(f"trailing {chat_id} {symbol}: TP1 сработал, SL переведён в б/у ({new_sl})")
+        return trade
+
+    # Шаг 2: трейлинг — двигаем SL только в прибыльную сторону.
+    klines = get_klines(symbol, "1h", 30)
+    if not klines or len(klines) < 15:
+        return trade
+    df = klines_to_df(klines)
+    atr_now = calc_atr(df, 14).iloc[-1]
+    last_price = df["close"].iloc[-1]
+    trail_dist = atr_now * ATR_TRAIL_MULT
+
+    if direction == "long":
+        new_sl = last_price - trail_dist
+        if new_sl > trade["trail_sl"]:
+            ok, new_oid = _move_sl_order(
+                symbol, trade.get("sl_order_id"), new_sl, close_side,
+                abs(pos_amt), trade.get("qty_precision", 3), trade.get("price_precision", 2),
+                api_key, api_secret, chat_id=chat_id,
+            )
+            if ok:
+                trade["sl_order_id"] = new_oid
+                trade["trail_sl"] = new_sl
+                logger.info(f"trailing {chat_id} {symbol}: SL поднят до {new_sl}")
+    else:
+        new_sl = last_price + trail_dist
+        if new_sl < trade["trail_sl"]:
+            ok, new_oid = _move_sl_order(
+                symbol, trade.get("sl_order_id"), new_sl, close_side,
+                abs(pos_amt), trade.get("qty_precision", 3), trade.get("price_precision", 2),
+                api_key, api_secret, chat_id=chat_id,
+            )
+            if ok:
+                trade["sl_order_id"] = new_oid
+                trade["trail_sl"] = new_sl
+                logger.info(f"trailing {chat_id} {symbol}: SL опущен до {new_sl}")
+    return trade
+
+
+async def trailing_stop_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """Фоновый job: раз в 2 минуты проверяет открытые авто-позиции на предмет
+    перевода в б/у после TP1 и последующего трейлинга. SL/TP на бирже фиксированы,
+    без этой логики вторая половина позиции (до TP2) отдаёт всю прибыль при откате."""
+    for chat_id in list(OPEN_AUTOTRADES.keys()):
+        keys = USER_KEYS.get(chat_id)
+        if not keys:
+            continue
+        trades = OPEN_AUTOTRADES.get(chat_id, [])
+        if not trades:
+            continue
+        loop = asyncio.get_running_loop()
+        updated = []
+        for trade in trades:
+            try:
+                res = await loop.run_in_executor(
+                    None, trailing_stop_manage_one, trade,
+                    keys["api_key"], keys["api_secret"], chat_id,
+                )
+                if res is not None:
+                    updated.append(res)
+            except Exception as e:
+                logger.warning(f"trailing_stop_job {chat_id} {trade.get('symbol')}: {e}")
+                updated.append(trade)  # оставляем как есть, разберёмся в следующем цикле
+        OPEN_AUTOTRADES[chat_id] = updated
+
+
 def place_futures_market_order(symbol, side, quantity, qty_precision, api_key, api_secret, chat_id=None):
     """Открывает рыночный ордер на фьючерсах."""
     qty = round(quantity, qty_precision)
@@ -2729,6 +2975,11 @@ async def execute_trade(chat_id, trade_info, ctx):
         "tp1_order_id":tp1_res.get("orderId") if tp1_ok else None,
         "tp2_order_id":tp2_res.get("orderId") if tp2_ok else None,
         "opened_at":   datetime.utcnow().isoformat(),
+        # Состояние трейлинг-логики (обрабатывается trailing_stop_job):
+        "tp1_filled":  False,                 # сработал ли TP1 (половина закрыта)
+        "be_set":      False,                 # переведён ли стоп в безубыток
+        "trail_sl":    sl,                    # текущий уровень трейлинг-стопа
+        "atr_at_open": atr,                    # ATR на момент входа — для дистанции trail
     })
 
     dir_label = "🟢 LONG" if direction == "long" else "🔴 SHORT"
@@ -3074,26 +3325,39 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
             mtf_score, _ = strat_results.get("multitf",           (0, []))
 
             combined   = quick_score * 1.0 + strat_total * 0.5
-            strat_dir  = "long" if strat_total > 0 else "short"
 
-            # Направления должны совпадать
-            if direction_quick != strat_dir:
-                logger.info(f"autotrade {symbol}: скан={direction_quick} vs стратегии={strat_dir} — не совпадают")
+            # ── Мульти-ТФ фильтр: смягчённая версия ────────────────────────────
+            # Раньше направление стратегий обязано было СТРОГО совпадать с quick,
+            # иначе сигнал дропался — это резало краевые (|strat_total|≈0) сигналы.
+            # Теперь:
+            #   - блокируем ТОЛЬКО при явном конфликте (strat_total заметно
+            #     противоположен quick) — |strat_total| >= 1.0 в обратную сторону;
+            #   - при нейтральных стратегиях (|strat_total| < 1.0) — пропускаем;
+            #   - при совпадении — небольшой бонус к combined.
+            strat_opp = (quick_score > 0 and strat_total <= -1.0) or \
+                        (quick_score < 0 and strat_total >= 1.0)
+            if strat_opp:
+                logger.info(f"autotrade {symbol}: явный конфликт скан={direction_quick} vs стратегии total={strat_total:+.1f} — пропускаем")
                 continue
 
-            if abs(combined) < AUTOTRADE_SCORE_THRESHOLD * 1.2:
+            if (quick_score > 0 and strat_total >= 1.0) or (quick_score < 0 and strat_total <= -1.0):
+                combined += 0.5  # бонус за подтверждение направления стратегиями
+
+            if abs(combined) < AUTOTRADE_SCORE_THRESHOLD:
                 continue
 
             direction = direction_quick
             price = df1h["close"].iloc[-1]
             atr   = calc_atr(df1h, 14).iloc[-1]
-            risk  = atr * 1.5
+            # SL по структуре рынка (swing ± ATR-cap), не голый ATR*1.5 —
+            # tighter стоп реже выбивается шумом, а cap не даёт раздуть риск.
+            sl, risk = calc_structural_sl(price, atr, direction, df1h)
 
             if direction == "long":
-                sl, tp1, tp2 = price - risk, price + risk * 1.5, price + risk * 3.0
+                tp1, tp2 = price + risk * 1.5, price + risk * 3.0
                 dir_label = "🟢 LONG"
             else:
-                sl, tp1, tp2 = price + risk, price - risk * 1.5, price - risk * 3.0
+                tp1, tp2 = price - risk * 1.5, price - risk * 3.0
                 dir_label = "🔴 SHORT"
 
             strat_scores = [mr_score, tp_score, bo_score, ds_score, mtf_score]
@@ -3232,11 +3496,14 @@ def main():
     app.add_error_handler(global_error_handler)
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    # Фоновые задачи: проверка подписанных монет каждые 10 мин, рыночный скан каждый час
-    app.job_queue.run_repeating(alert_job, interval=600, first=30)
-    app.job_queue.run_repeating(market_scan_job, interval=3600, first=60)
-    # Автоторговля: скан каждые 15 минут
-    app.job_queue.run_repeating(autotrade_scan_job, interval=600, first=90)
+    # Фоновые задачи. Алерты и автоторговля разнесены по фазе (first=30 и first=330),
+    # чтобы не бить Binance-лимиты одновременно — оба скана тяжёлые (по 60 символов).
+    app.job_queue.run_repeating(alert_job,         interval=600,  first=30)
+    app.job_queue.run_repeating(market_scan_job,   interval=3600, first=60)
+    # Автоторговля: скан каждые 10 мин, но со сдвигом +5 мин относительно алертов.
+    app.job_queue.run_repeating(autotrade_scan_job, interval=600,  first=330)
+    # Трейлинг-стоп / перевод в б/у после TP1 — каждые 2 мин, лёгкий job.
+    app.job_queue.run_repeating(trailing_stop_job,  interval=120,  first=120)
 
     logger.info("Бот запущен...")
     app.run_polling()
