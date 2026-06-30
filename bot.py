@@ -2888,121 +2888,136 @@ async def execute_trade(chat_id, trade_info, ctx):
     if fill_price == 0:
         fill_price = entry
 
-    # Ждём подтверждения позиции биржей
-    loop = asyncio.get_event_loop()
-    position_confirmed = False
-    for _ in range(5):
-        await asyncio.sleep(1.0)
-        pos_amt = await loop.run_in_executor(
-            None, get_open_position_amt, symbol, keys["api_key"], keys["api_secret"], chat_id
+    try:
+        # Ждём подтверждения позиции биржей
+        loop = asyncio.get_event_loop()
+        position_confirmed = False
+        for _ in range(5):
+            await asyncio.sleep(1.0)
+            pos_amt = await loop.run_in_executor(
+                None, get_open_position_amt, symbol, keys["api_key"], keys["api_secret"], chat_id
+            )
+            if pos_amt is not None and abs(pos_amt) > 0:
+                position_confirmed = True
+                break
+
+        if not position_confirmed:
+            logger.warning(f"execute_trade {symbol}: позиция не подтвердилась за 5 попыток")
+
+        # ── SL + TP1 + TP2 с retry ───────────────────────────────────────────────
+        close_side = "SELL" if direction == "long" else "BUY"
+
+        def _place_with_retry(params_base, label, attempts=4, delay=1.5):
+            """Каждая попытка генерирует свежий timestamp — именно это исправляет
+            'Signature for this request is not valid' при повторных вызовах."""
+            last_res = None
+            for attempt in range(1, attempts + 1):
+                params = dict(params_base)
+                params["timestamp"]  = int(time.time() * 1000)
+                params["recvWindow"] = 5000
+                qs  = "&".join(f"{k}={v}" for k, v in params.items())
+                sig = hmac.new(keys["api_secret"].encode(), qs.encode(), hashlib.sha256).hexdigest()
+                params["signature"] = sig
+                headers = {"X-MBX-APIKEY": keys["api_key"]}
+                base_url = get_futures_api(chat_id)
+                try:
+                    r = requests.post(f"{base_url}/fapi/v1/order",
+                                      params=params, headers=headers, timeout=10)
+                    data = r.json()
+                    if "orderId" in data:
+                        return data
+                    last_res = data
+                    logger.warning(f"{label} попытка {attempt}/{attempts}: {data}")
+                except Exception as e:
+                    last_res = {"msg": str(e)}
+                    logger.warning(f"{label} попытка {attempt}/{attempts} исключение: {e}")
+                if attempt < attempts:
+                    time.sleep(delay)
+            return last_res
+
+        sl_base = {
+            "symbol": symbol, "side": close_side, "type": "STOP_MARKET",
+            "quantity": round(qty_total, qty_precision),
+            "stopPrice": round(sl, price_precision),
+            "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
+        }
+        tp1_base = {
+            "symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
+            "quantity": round(qty_half, qty_precision),
+            "stopPrice": round(tp1, price_precision),
+            "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
+        }
+        tp2_base = {
+            "symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
+            "quantity": round(qty_half, qty_precision),
+            "stopPrice": round(tp2, price_precision),
+            "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
+        }
+
+        sl_res  = await loop.run_in_executor(None, _place_with_retry, sl_base,  f"SL  {symbol}")
+        tp1_res = await loop.run_in_executor(None, _place_with_retry, tp1_base, f"TP1 {symbol}")
+        tp2_res = await loop.run_in_executor(None, _place_with_retry, tp2_base, f"TP2 {symbol}")
+
+        sl_ok  = sl_res  and "orderId" in sl_res
+        tp1_ok = tp1_res and "orderId" in tp1_res
+        tp2_ok = tp2_res and "orderId" in tp2_res
+
+        def _err(res):
+            msg = (res or {}).get("msg", "нет ответа")
+            return str(msg).replace("`","").replace("*","").replace("_"," ")
+
+        OPEN_AUTOTRADES.setdefault(chat_id, []).append({
+            **trade_info,
+            "entry":       fill_price,
+            "qty":         qty_total,
+            "qty_half":    qty_half,
+            "order_id":    order["orderId"],
+            "sl_order_id": sl_res.get("orderId")  if sl_ok  else None,
+            "tp1_order_id":tp1_res.get("orderId") if tp1_ok else None,
+            "tp2_order_id":tp2_res.get("orderId") if tp2_ok else None,
+            "opened_at":   datetime.utcnow().isoformat(),
+            # Состояние трейлинг-логики (обрабатывается trailing_stop_job):
+            "tp1_filled":  False,                 # сработал ли TP1 (половина закрыта)
+            "be_set":      False,                 # переведён ли стоп в безубыток
+            "trail_sl":    sl,                    # текущий уровень трейлинг-стопа
+            "atr_at_open": trade_info.get("atr", atr_risk_price),
+        })
+
+        dir_label = "🟢 LONG" if direction == "long" else "🔴 SHORT"
+        notional  = qty_total * fill_price / DEFAULT_LEVERAGE
+        daily_loss = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0)
+        limit_usdt = balance * DAILY_LOSS_LIMIT_PCT / 100
+
+        await ctx.bot.send_message(
+            chat_id,
+            f"✅ *Позиция открыта!* {mode_label}\n\n"
+            f"{dir_label} *{symbol.replace('USDT', '')}*\n"
+            f"💵 Вход: `{fmt_price(fill_price)}`\n"
+            f"📦 Объём: `{qty_total}` (~`${notional:,.2f} USDT` маржи)\n"
+            f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n\n"
+            f"🛑 SL (100%): `{fmt_price(sl)}` {'✅' if sl_ok else '⚠️ ' + _err(sl_res)}\n"
+            f"🎯 TP1 (50%): `{fmt_price(tp1)}` {'✅' if tp1_ok else '⚠️ ' + _err(tp1_res)}\n"
+            f"🎯 TP2 (50%): `{fmt_price(tp2)}` {'✅' if tp2_ok else '⚠️ ' + _err(tp2_res)}\n\n"
+            f"🛡 Дневной убыток: `${daily_loss:.2f}` / `${limit_usdt:.2f}`\n\n"
+            f"_50% позиции закроется на TP1, 50% — на TP2_\n"
+            f"Используй `/autoportfolio` для отслеживания.\n"
+            f"⚠️ _Торговля связана с риском потери средств._",
+            parse_mode="Markdown"
         )
-        if pos_amt is not None and abs(pos_amt) > 0:
-            position_confirmed = True
-            break
-
-    if not position_confirmed:
-        logger.warning(f"execute_trade {symbol}: позиция не подтвердилась за 5 попыток")
-
-    # ── SL + TP1 + TP2 с retry ───────────────────────────────────────────────
-    close_side = "SELL" if direction == "long" else "BUY"
-
-    def _place_with_retry(params_base, label, attempts=4, delay=1.5):
-        """Каждая попытка генерирует свежий timestamp — именно это исправляет
-        'Signature for this request is not valid' при повторных вызовах."""
-        last_res = None
-        for attempt in range(1, attempts + 1):
-            params = dict(params_base)
-            params["timestamp"]  = int(time.time() * 1000)
-            params["recvWindow"] = 5000
-            qs  = "&".join(f"{k}={v}" for k, v in params.items())
-            sig = hmac.new(keys["api_secret"].encode(), qs.encode(), hashlib.sha256).hexdigest()
-            params["signature"] = sig
-            headers = {"X-MBX-APIKEY": keys["api_key"]}
-            base_url = get_futures_api(chat_id)
-            try:
-                r = requests.post(f"{base_url}/fapi/v1/order",
-                                  params=params, headers=headers, timeout=10)
-                data = r.json()
-                if "orderId" in data:
-                    return data
-                last_res = data
-                logger.warning(f"{label} попытка {attempt}/{attempts}: {data}")
-            except Exception as e:
-                last_res = {"msg": str(e)}
-                logger.warning(f"{label} попытка {attempt}/{attempts} исключение: {e}")
-            if attempt < attempts:
-                time.sleep(delay)
-        return last_res
-
-    sl_base = {
-        "symbol": symbol, "side": close_side, "type": "STOP_MARKET",
-        "quantity": round(qty_total, qty_precision),
-        "stopPrice": round(sl, price_precision),
-        "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
-    }
-    tp1_base = {
-        "symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
-        "quantity": round(qty_half, qty_precision),
-        "stopPrice": round(tp1, price_precision),
-        "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
-    }
-    tp2_base = {
-        "symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
-        "quantity": round(qty_half, qty_precision),
-        "stopPrice": round(tp2, price_precision),
-        "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
-    }
-
-    sl_res  = await loop.run_in_executor(None, _place_with_retry, sl_base,  f"SL  {symbol}")
-    tp1_res = await loop.run_in_executor(None, _place_with_retry, tp1_base, f"TP1 {symbol}")
-    tp2_res = await loop.run_in_executor(None, _place_with_retry, tp2_base, f"TP2 {symbol}")
-
-    sl_ok  = sl_res  and "orderId" in sl_res
-    tp1_ok = tp1_res and "orderId" in tp1_res
-    tp2_ok = tp2_res and "orderId" in tp2_res
-
-    def _err(res):
-        msg = (res or {}).get("msg", "нет ответа")
-        return str(msg).replace("`","").replace("*","").replace("_"," ")
-
-    OPEN_AUTOTRADES.setdefault(chat_id, []).append({
-        **trade_info,
-        "entry":       fill_price,
-        "qty":         qty_total,
-        "qty_half":    qty_half,
-        "order_id":    order["orderId"],
-        "sl_order_id": sl_res.get("orderId")  if sl_ok  else None,
-        "tp1_order_id":tp1_res.get("orderId") if tp1_ok else None,
-        "tp2_order_id":tp2_res.get("orderId") if tp2_ok else None,
-        "opened_at":   datetime.utcnow().isoformat(),
-        # Состояние трейлинг-логики (обрабатывается trailing_stop_job):
-        "tp1_filled":  False,                 # сработал ли TP1 (половина закрыта)
-        "be_set":      False,                 # переведён ли стоп в безубыток
-        "trail_sl":    sl,                    # текущий уровень трейлинг-стопа
-        "atr_at_open": atr,                    # ATR на момент входа — для дистанции trail
-    })
-
-    dir_label = "🟢 LONG" if direction == "long" else "🔴 SHORT"
-    notional  = qty_total * fill_price / DEFAULT_LEVERAGE
-    daily_loss = AUTOTRADE_DAILY_LOSS.get(chat_id, 0.0)
-    limit_usdt = balance * DAILY_LOSS_LIMIT_PCT / 100
-
-    await ctx.bot.send_message(
-        chat_id,
-        f"✅ *Позиция открыта!* {mode_label}\n\n"
-        f"{dir_label} *{symbol.replace('USDT', '')}*\n"
-        f"💵 Вход: `{fmt_price(fill_price)}`\n"
-        f"📦 Объём: `{qty_total}` (~`${notional:,.2f} USDT` маржи)\n"
-        f"⚖️ Плечо: `x{DEFAULT_LEVERAGE}`\n\n"
-        f"🛑 SL (100%): `{fmt_price(sl)}` {'✅' if sl_ok else '⚠️ ' + _err(sl_res)}\n"
-        f"🎯 TP1 (50%): `{fmt_price(tp1)}` {'✅' if tp1_ok else '⚠️ ' + _err(tp1_res)}\n"
-        f"🎯 TP2 (50%): `{fmt_price(tp2)}` {'✅' if tp2_ok else '⚠️ ' + _err(tp2_res)}\n\n"
-        f"🛡 Дневной убыток: `${daily_loss:.2f}` / `${limit_usdt:.2f}`\n\n"
-        f"_50% позиции закроется на TP1, 50% — на TP2_\n"
-        f"Используй `/autoportfolio` для отслеживания.\n"
-        f"⚠️ _Торговля связана с риском потери средств._",
-        parse_mode="Markdown"
-    )
+    except Exception as e:
+        # Позиция на бирже УЖЕ открыта (market-ордер прошёл выше) — если что-то
+        # упало при выставлении SL/TP или сохранении состояния, пользователь
+        # должен узнать об этом сразу, а не получить тишину как раньше (баг
+        # с необъявленной переменной atr приводил именно к молчаливому падению).
+        logger.error(f"execute_trade {symbol}: ошибка после открытия позиции: {e}", exc_info=True)
+        await ctx.bot.send_message(
+            chat_id,
+            f"⚠️ *Позиция по {symbol.replace('USDT','')} открыта на бирже*, "
+            f"но при выставлении SL/TP или сохранении состояния произошла ошибка:\n"
+            f"`{e}`\n\n"
+            f"Срочно проверь позицию и стопы вручную: `/positions`",
+            parse_mode="Markdown"
+        )
 
 
 # ─── Автоторговля: команды ────────────────────────────────────────────────────
@@ -3397,6 +3412,7 @@ async def autotrade_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
             "symbol": symbol, "direction": direction,
             "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2,
             "score": combined,
+            "atr": atr,
             "created_at": time.time(),
         }
 
