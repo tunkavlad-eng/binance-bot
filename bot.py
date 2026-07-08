@@ -2437,16 +2437,42 @@ def get_futures_balance(api_key, api_secret, chat_id=None):
             r = requests.get(f"{DEMO_FUTURES_API}/fapi/v3/balance", params=params, headers=headers, timeout=10)
             data = r.json()
             if isinstance(data, list):
-                total = sum(float(a["availableBalance"]) for a in data if a.get("asset") in ("USDT", "USDC"))
+                # Тот же фикс, что и для REAL: в Multi-Assets Mode суммирование
+                # USDT+USDC задваивает баланс (виртуальная запись с тем же
+                # значением обеспечения). Берём активы с реальным walletBalance > 0.
+                total = sum(
+                    float(a["availableBalance"]) for a in data
+                    if a.get("asset") in ("USDT", "USDC") and float(a.get("balance", a.get("walletBalance", 0)) or 0) > 0
+                )
                 return total if total > 0 else None
         except Exception as e:
             logger.warning(f"get_futures_balance demo: {e}")
         return None
 
     data = futures_signed_request("GET", "fapi/v3/account", api_key, api_secret, chat_id=chat_id)
-    if not data or "assets" not in data:
+    if not data:
         return None
-    total = sum(float(a["availableBalance"]) for a in data["assets"] if a["asset"] in ("USDT", "USDC"))
+    # ВАЖНО: раньше суммировали availableBalance по каждому активу (USDT + USDC).
+    # В Multi-Assets Mode (кросс-маржа) это даёт ДВОЙНОЙ счёт — Binance отдаёт
+    # конвертированное значение обеспечения в записях нескольких активов, а не
+    # реальные отдельные остатки. Используем account-level поле, где Binance
+    # уже сам агрегирует итог без дублирования.
+    if "availableBalance" in data:
+        try:
+            total = float(data["availableBalance"])
+            if total > 0:
+                return total
+        except (TypeError, ValueError):
+            pass
+    if "assets" not in data:
+        return None
+    # Фолбэк для старых ответов без top-level availableBalance: берём только
+    # активы с ненулевым РЕАЛЬНЫМ walletBalance, чтобы не суммировать
+    # виртуальные multi-asset записи с нулевым фактическим балансом.
+    total = sum(
+        float(a["availableBalance"]) for a in data["assets"]
+        if a["asset"] in ("USDT", "USDC") and float(a.get("walletBalance", 0)) > 0
+    )
     return total if total > 0 else None
 
 
