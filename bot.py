@@ -1956,16 +1956,18 @@ async def balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     keys = USER_KEYS[user_id]
     mode = USER_MODE.get(user_id, "real")
 
-    if mode == "demo":
-        # Demo-ключ выпущен под фьючерсы (demo-fapi) — спотового баланса там нет,
-        # показываем фьючерсный баланс через тот же эндпоинт, что и /positions.
-        msg = await update.message.reply_text("⏳ Получаю фьючерсный баланс (DEMO)...")
+    # Явный запрос фьючерсного баланса: /balance futures
+    want_futures = bool(ctx.args) and ctx.args[0].lower() in ("futures", "fut", "f")
+
+    if mode == "demo" or want_futures:
+        label = "DEMO" if mode == "demo" else "REAL"
+        msg = await update.message.reply_text(f"⏳ Получаю фьючерсный баланс ({label})...")
         bal = get_futures_balance(keys["api_key"], keys["api_secret"], chat_id=user_id)
         if bal is None:
             await msg.edit_text("❌ Ошибка. Проверь права API ключа (нужен Enable Futures).")
             return
         await msg.edit_text(
-            f"💼 *Фьючерсный баланс (DEMO)*\n\n💰 Доступно: `${bal:,.2f} USDT`",
+            f"💼 *Фьючерсный баланс ({label})*\n\n💰 Доступно: `${bal:,.2f} USDT`",
             parse_mode="Markdown"
         )
         return
