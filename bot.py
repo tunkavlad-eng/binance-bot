@@ -56,6 +56,14 @@ ATR_SL_LOOKBACK  = 20                         # глубина поиска swin
 ATR_TRAIL_MULT   = 1.0                        # дистанция трейлинг-стопа после TP1, в ATR
 PENDING_TRADE_TTL_SEC = 1800                  # сколько живёт неподтверждённый авто-сигнал (30 мин)
 
+# ─── Спот грид-бот (/gridbot) ─────────────────────────────────────────────────
+# Простая сетка "купи на просадке / продай на росте" на споте.
+# Работает ТОЛЬКО в REAL режиме — демо-аккаунт в этом боте только для фьючерсов,
+# спотового баланса там нет.
+GRID_BOTS: dict[int, dict[str, dict]] = {}   # chat_id -> symbol -> grid state
+GRID_MAX_ORDERS_DEFAULT = 5                  # сколько открытых уровней покупки максимум
+GRID_JOB_INTERVAL_SEC = 60                   # как часто проверяем цену для грид-ботов
+
 # ─── Дневной лимит убытков ────────────────────────────────────────────────────
 DAILY_LOSS_LIMIT_PCT = 5.0                   # максимальный дневной убыток в % от баланса
 AUTOTRADE_DAILY_LOSS: dict[int, float] = {}  # chat_id -> сумма убытков за сегодня ($)
@@ -1583,7 +1591,8 @@ HELP_SECTIONS = {
         "• `/positions` — открытые фьючерсные позиции и PnL\n"
         "• `/deletekey` — удалить ключи\n"
         "• `/autotrade on/off/status` — автоторговля по сильным сигналам (нужны ключи с правом Futures Trading)\n"
-        "• `/autoportfolio` — открытые авто-позиции и live PnL\n\n"
+        "• `/autoportfolio` — открытые авто-позиции и live PnL\n"
+        "• `/gridbot BTC start ШАГ% СУММА` — спот грид-бот (покупка на просадке / продажа на росте), нужны ключи с правом Spot Trading\n\n"
         "⚠️ _Для real-режима создавай ключ только с нужными правами. НИКОГДА не давай право "
         "на вывод средств (Withdrawal). Используй `/setkey` только в личке "
         "с ботом, не в группах — ключи хранятся в памяти без шифрования._"
@@ -1956,18 +1965,16 @@ async def balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     keys = USER_KEYS[user_id]
     mode = USER_MODE.get(user_id, "real")
 
-    # Явный запрос фьючерсного баланса: /balance futures
-    want_futures = bool(ctx.args) and ctx.args[0].lower() in ("futures", "fut", "f")
-
-    if mode == "demo" or want_futures:
-        label = "DEMO" if mode == "demo" else "REAL"
-        msg = await update.message.reply_text(f"⏳ Получаю фьючерсный баланс ({label})...")
+    if mode == "demo":
+        # Demo-ключ выпущен под фьючерсы (demo-fapi) — спотового баланса там нет,
+        # показываем фьючерсный баланс через тот же эндпоинт, что и /positions.
+        msg = await update.message.reply_text("⏳ Получаю фьючерсный баланс (DEMO)...")
         bal = get_futures_balance(keys["api_key"], keys["api_secret"], chat_id=user_id)
         if bal is None:
             await msg.edit_text("❌ Ошибка. Проверь права API ключа (нужен Enable Futures).")
             return
         await msg.edit_text(
-            f"💼 *Фьючерсный баланс ({label})*\n\n💰 Доступно: `${bal:,.2f} USDT`",
+            f"💼 *Фьючерсный баланс (DEMO)*\n\n💰 Доступно: `${bal:,.2f} USDT`",
             parse_mode="Markdown"
         )
         return
@@ -2010,15 +2017,13 @@ async def positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text("⏳ Получаю позиции...")
     keys = USER_KEYS[user_id]
+    data = futures_signed_request("GET", "fapi/v3/account", keys["api_key"], keys["api_secret"], chat_id=user_id)
 
-    # fapi/v2/positionRisk быстрее и надёжнее на demo чем fapi/v3/account
-    data = futures_signed_request("GET", "fapi/v2/positionRisk", keys["api_key"], keys["api_secret"], chat_id=user_id)
-
-    if not data or isinstance(data, dict) and "code" in data:
+    if not data or "code" in data:
         await msg.edit_text("❌ Ошибка. Нужны права на Futures.", parse_mode="Markdown")
         return
 
-    open_pos = [p for p in (data if isinstance(data, list) else []) if float(p.get("positionAmt", 0)) != 0]
+    open_pos = [p for p in data.get("positions", []) if float(p["positionAmt"]) != 0]
     if not open_pos:
         await msg.edit_text("📭 Нет открытых позиций.")
         return
@@ -2027,12 +2032,12 @@ async def positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     total_pnl = 0.0
     for p in open_pos:
         amt = float(p["positionAmt"])
-        pnl = float(p.get("unrealizedProfit", 0))
+        pnl = float(p["unrealizedProfit"])
         total_pnl += pnl
         side = "🟢 LONG" if amt > 0 else "🔴 SHORT"
         lines.append(f"*{p['symbol']}* {side}\n  Кол-во: `{abs(amt)}`  Вход: `{fmt_price(float(p['entryPrice']))}`  PnL: `${pnl:+,.2f}`\n")
 
-    lines.append(f"*Общий PnL:* `${total_pnl:+,.2f} USDT`")
+    lines.append(f"*Общий PnL:* `${ total_pnl:+,.2f} USDT`")
     await msg.edit_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -2437,42 +2442,16 @@ def get_futures_balance(api_key, api_secret, chat_id=None):
             r = requests.get(f"{DEMO_FUTURES_API}/fapi/v3/balance", params=params, headers=headers, timeout=10)
             data = r.json()
             if isinstance(data, list):
-                # Тот же фикс, что и для REAL: в Multi-Assets Mode суммирование
-                # USDT+USDC задваивает баланс (виртуальная запись с тем же
-                # значением обеспечения). Берём активы с реальным walletBalance > 0.
-                total = sum(
-                    float(a["availableBalance"]) for a in data
-                    if a.get("asset") in ("USDT", "USDC") and float(a.get("balance", a.get("walletBalance", 0)) or 0) > 0
-                )
+                total = sum(float(a["availableBalance"]) for a in data if a.get("asset") in ("USDT", "USDC"))
                 return total if total > 0 else None
         except Exception as e:
             logger.warning(f"get_futures_balance demo: {e}")
         return None
 
     data = futures_signed_request("GET", "fapi/v3/account", api_key, api_secret, chat_id=chat_id)
-    if not data:
+    if not data or "assets" not in data:
         return None
-    # ВАЖНО: раньше суммировали availableBalance по каждому активу (USDT + USDC).
-    # В Multi-Assets Mode (кросс-маржа) это даёт ДВОЙНОЙ счёт — Binance отдаёт
-    # конвертированное значение обеспечения в записях нескольких активов, а не
-    # реальные отдельные остатки. Используем account-level поле, где Binance
-    # уже сам агрегирует итог без дублирования.
-    if "availableBalance" in data:
-        try:
-            total = float(data["availableBalance"])
-            if total > 0:
-                return total
-        except (TypeError, ValueError):
-            pass
-    if "assets" not in data:
-        return None
-    # Фолбэк для старых ответов без top-level availableBalance: берём только
-    # активы с ненулевым РЕАЛЬНЫМ walletBalance, чтобы не суммировать
-    # виртуальные multi-asset записи с нулевым фактическим балансом.
-    total = sum(
-        float(a["availableBalance"]) for a in data["assets"]
-        if a["asset"] in ("USDT", "USDC") and float(a.get("walletBalance", 0)) > 0
-    )
+    total = sum(float(a["availableBalance"]) for a in data["assets"] if a["asset"] in ("USDT", "USDC"))
     return total if total > 0 else None
 
 
@@ -2494,6 +2473,53 @@ def get_symbol_info(symbol, chat_id=None):
     except Exception as e:
         logger.error(f"get_symbol_info {symbol}: {e}")
     return 2, 3, 0.001
+
+
+# ─── Спот грид-бот: helpers ───────────────────────────────────────────────────
+
+_SPOT_SYMBOL_INFO_CACHE: dict = {}   # symbol -> {"data": (...), "time": float}
+SPOT_SYMBOL_INFO_CACHE_TTL = 1800
+
+def get_spot_symbol_info(symbol):
+    """Точность цены/количества и минимальный размер сделки (NOTIONAL) для спот-пары."""
+    now = time.time()
+    cached = _SPOT_SYMBOL_INFO_CACHE.get(symbol)
+    if cached and now - cached["time"] < SPOT_SYMBOL_INFO_CACHE_TTL:
+        return cached["data"]
+    try:
+        r = requests.get(f"{BINANCE_API}/exchangeInfo", params={"symbol": symbol}, timeout=10)
+        r.raise_for_status()
+        info = r.json()["symbols"][0]
+        qty_precision = info["baseAssetPrecision"]
+        price_precision = info["quoteAssetPrecision"]
+        step_size = None
+        min_notional = 10.0
+        for f in info["filters"]:
+            if f["filterType"] == "LOT_SIZE":
+                step_size = float(f["stepSize"])
+                # выводим точность количества из stepSize (например 0.001 → 3 знака)
+                s = f["stepSize"].rstrip("0")
+                qty_precision = len(s.split(".")[1]) if "." in s else 0
+            if f["filterType"] in ("NOTIONAL", "MIN_NOTIONAL"):
+                min_notional = float(f.get("minNotional", f.get("notional", 10.0)))
+        data = (price_precision, qty_precision, step_size, min_notional)
+        _SPOT_SYMBOL_INFO_CACHE[symbol] = {"data": data, "time": now}
+        return data
+    except Exception as e:
+        logger.warning(f"get_spot_symbol_info {symbol}: {e}")
+        return cached["data"] if cached else (2, 5, None, 10.0)
+
+
+def place_spot_market_order(symbol, side, api_key, api_secret, quote_qty=None, quantity=None):
+    """Рыночный ордер на споте. side: BUY/SELL.
+    Для BUY обычно удобнее quoteOrderQty (сколько USDT потратить),
+    для SELL — quantity (сколько базового актива продать)."""
+    params = {"symbol": symbol, "side": side, "type": "MARKET"}
+    if quote_qty is not None:
+        params["quoteOrderQty"] = quote_qty
+    if quantity is not None:
+        params["quantity"] = quantity
+    return signed_request("POST", f"{BINANCE_API}/order", api_key, api_secret, params)
 
 
 _FUTURES_SYMBOLS_CACHE: dict = {}   # base_url -> {"symbols": set, "time": float}
@@ -2813,6 +2839,315 @@ async def trailing_stop_job(ctx: ContextTypes.DEFAULT_TYPE):
         OPEN_AUTOTRADES[chat_id] = updated
 
 
+def _grid_close_all_positions(chat_id, symbol, api_key, api_secret):
+    """Продаёт по рынку весь накопленный объём по открытым уровням грида.
+    Используется /gridbot SYMBOL sell_all и /gridbot SYMBOL stop (с продажей).
+    Возвращает (sold_qty, error_msg|None)."""
+    grid = GRID_BOTS.get(chat_id, {}).get(symbol)
+    if not grid or not grid["open_positions"]:
+        return 0.0, None
+
+    total_qty = sum(p["qty"] for p in grid["open_positions"])
+    _, qty_precision, _, _ = get_spot_symbol_info(symbol)
+    qty = round(total_qty, qty_precision)
+    if qty <= 0:
+        grid["open_positions"] = []
+        return 0.0, None
+
+    res = place_spot_market_order(symbol, "SELL", api_key, api_secret, quantity=qty)
+    if not res or "orderId" not in res:
+        return 0.0, f"{res}"
+
+    fill_price = float(res.get("fills", [{}])[0].get("price", 0)) if res.get("fills") else None
+    for p in grid["open_positions"]:
+        sell_price = fill_price or p["target_sell"]
+        grid["realized_pnl"] += (sell_price - p["buy_price"]) * p["qty"]
+    grid["open_positions"] = []
+    return qty, None
+
+
+def grid_bot_manage_one(chat_id, symbol, grid, api_key, api_secret):
+    """Проверяет один грид-бот: покупает на просадке, продаёт на росте своих же
+    уровней. Блокирующая функция — дёргается через run_in_executor.
+    Возвращает список текстовых уведомлений о совершённых сделках (для отправки в чат)."""
+    notes = []
+    ticker = get_ticker_24h(symbol)
+    if not ticker or "code" in ticker:
+        return notes
+    price = float(ticker["lastPrice"])
+
+    step_pct = grid["step_pct"]
+    amount_usd = grid["amount_usd"]
+    max_orders = grid["max_orders"]
+
+    # ── Продажа: каждый открытый уровень проверяем на достижение своей цели ──
+    still_open = []
+    for pos in grid["open_positions"]:
+        if price >= pos["target_sell"]:
+            _, qty_precision, _, _ = get_spot_symbol_info(symbol)
+            qty = round(pos["qty"], qty_precision)
+            res = place_spot_market_order(symbol, "SELL", api_key, api_secret, quantity=qty)
+            if res and "orderId" in res:
+                fill_price = float(res["fills"][0]["price"]) if res.get("fills") else pos["target_sell"]
+                pnl = (fill_price - pos["buy_price"]) * qty
+                grid["realized_pnl"] += pnl
+                grid["total_sold"] += 1
+                notes.append(
+                    f"💰 *{symbol.replace('USDT','')}*: продано `{qty}` по `{fmt_price(fill_price)}` "
+                    f"(куплено по `{fmt_price(pos['buy_price'])}`) → PnL `${pnl:+.2f}`"
+                )
+                # После продажи уровня отпускаем reference обратно к рынку,
+                # чтобы сетка не «зависала» на старой низкой точке навсегда.
+                grid["last_trigger_price"] = max(grid["last_trigger_price"], fill_price)
+            else:
+                logger.warning(f"gridbot {chat_id} {symbol}: ошибка продажи уровня: {res}")
+                still_open.append(pos)
+        else:
+            still_open.append(pos)
+    grid["open_positions"] = still_open
+
+    # ── Покупка: если просадка от последнего reference >= step_pct и есть место ──
+    if len(grid["open_positions"]) < max_orders:
+        trigger_price = grid["last_trigger_price"] * (1 - step_pct / 100)
+        if price <= trigger_price:
+            res = place_spot_market_order(symbol, "BUY", api_key, api_secret, quote_qty=round(amount_usd, 2))
+            if res and "orderId" in res:
+                fill_price = float(res["fills"][0]["price"]) if res.get("fills") else price
+                qty = float(res.get("executedQty", 0)) or (amount_usd / fill_price)
+                target_sell = fill_price * (1 + step_pct / 100)
+                grid["open_positions"].append({
+                    "buy_price": fill_price, "qty": qty,
+                    "target_sell": target_sell,
+                    "bought_at": datetime.utcnow().isoformat(),
+                })
+                grid["last_trigger_price"] = fill_price
+                grid["total_bought"] += 1
+                notes.append(
+                    f"🛒 *{symbol.replace('USDT','')}*: куплено `{qty:.6f}` по `{fmt_price(fill_price)}` "
+                    f"(цель продажи `{fmt_price(target_sell)}`)"
+                )
+            else:
+                logger.warning(f"gridbot {chat_id} {symbol}: ошибка покупки уровня: {res}")
+
+    return notes
+
+
+async def spot_grid_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """Фоновый job: раз в GRID_JOB_INTERVAL_SEC проверяет все активные спот грид-боты."""
+    if not GRID_BOTS:
+        return
+    loop = asyncio.get_running_loop()
+    for chat_id, grids in list(GRID_BOTS.items()):
+        keys = USER_KEYS.get(chat_id)
+        if not keys:
+            continue
+        if USER_MODE.get(chat_id, "real") != "real":
+            continue  # грид-бот работает только в REAL режиме (спота на demo нет)
+        for symbol, grid in list(grids.items()):
+            if not grid.get("active"):
+                continue
+            try:
+                notes = await loop.run_in_executor(
+                    None, grid_bot_manage_one, chat_id, symbol, grid,
+                    keys["api_key"], keys["api_secret"],
+                )
+                for note in notes:
+                    try:
+                        await ctx.bot.send_message(chat_id=chat_id, text=note, parse_mode="Markdown")
+                    except Exception as e:
+                        logger.warning(f"spot_grid_job send {chat_id}: {e}")
+            except Exception as e:
+                logger.warning(f"spot_grid_job {chat_id} {symbol}: {e}")
+
+
+async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /gridbot SYMBOL start ШАГ% СУММА [макс_ордеров]  — запустить сетку
+    /gridbot SYMBOL stop                              — остановить (позиция остаётся)
+    /gridbot SYMBOL status                            — статус: куплено, PnL, открытые уровни
+    /gridbot SYMBOL sell_all                          — экстренно продать всю накопленную позицию
+    /gridbot list                                     — все активные сетки
+    """
+    chat_id = update.effective_chat.id
+    args = ctx.args
+
+    if not args:
+        await update.message.reply_text(
+            "🕸 *Спот грид-бот*\n\n"
+            "• `/gridbot BTC start 2 15` — покупать BTC на $15 при падении на 2% от "
+            "последней сделки, продавать при росте на 2%\n"
+            "• `/gridbot BTC start 2 15 5` — то же самое, максимум 5 открытых уровней\n"
+            "• `/gridbot BTC stop` — остановить (открытая позиция остаётся у тебя)\n"
+            "• `/gridbot BTC status` — куплено, реализованный PnL, нереализованная прибыль\n"
+            "• `/gridbot BTC sell_all` — экстренно продать всю накопленную позицию\n"
+            "• `/gridbot list` — все активные сетки\n\n"
+            "⚠️ Работает только в *REAL* режиме (на demo-аккаунте нет спота).\n"
+            "Нужен API-ключ с правом *Enable Reading* и *Enable Spot Trading* (`/setkey`).",
+            parse_mode="Markdown"
+        )
+        return
+
+    if args[0].lower() == "list":
+        grids = GRID_BOTS.get(chat_id, {})
+        if not grids:
+            await update.message.reply_text("📭 Нет активных грид-ботов.")
+            return
+        lines = ["🕸 *Активные грид-боты:*\n"]
+        for sym, g in grids.items():
+            state = "🟢 работает" if g["active"] else "⏸ остановлен"
+            lines.append(
+                f"• *{sym.replace('USDT','')}*: {state} | шаг `{g['step_pct']}%` | "
+                f"`${g['amount_usd']}` | открыто уровней `{len(g['open_positions'])}/{g['max_orders']}` | "
+                f"PnL `${g['realized_pnl']:+.2f}`"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    symbol = normalize_symbol(args[0])
+    if len(args) < 2:
+        await update.message.reply_text("Использование: `/gridbot BTC start|stop|status|sell_all`", parse_mode="Markdown")
+        return
+
+    sub = args[1].lower()
+
+    if chat_id not in USER_KEYS:
+        await update.message.reply_text(
+            "❌ Сначала добавь API ключ: `/setkey API_KEY API_SECRET`", parse_mode="Markdown"
+        )
+        return
+
+    if USER_MODE.get(chat_id, "real") != "real":
+        await update.message.reply_text(
+            "❌ Грид-бот работает только в *REAL* режиме.\nПереключись: `/mode real`", parse_mode="Markdown"
+        )
+        return
+
+    keys = USER_KEYS[chat_id]
+
+    if sub == "start":
+        if len(args) < 4:
+            await update.message.reply_text(
+                "Использование: `/gridbot BTC start ШАГ% СУММА [макс_ордеров]`\n"
+                "Пример: `/gridbot BTC start 2 15`", parse_mode="Markdown"
+            )
+            return
+        try:
+            step_pct = float(args[2])
+            amount_usd = float(args[3])
+            max_orders = int(args[4]) if len(args) > 4 else GRID_MAX_ORDERS_DEFAULT
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат чисел.", parse_mode="Markdown")
+            return
+
+        if not (0.1 <= step_pct <= 50):
+            await update.message.reply_text("❌ Шаг должен быть от 0.1% до 50%.")
+            return
+        if amount_usd < 10:
+            await update.message.reply_text("❌ Сумма на уровень должна быть не меньше $10 (минимум Binance).")
+            return
+        if not (1 <= max_orders <= 20):
+            await update.message.reply_text("❌ Максимум ордеров должен быть от 1 до 20.")
+            return
+
+        ticker = get_ticker_24h(symbol)
+        if not ticker or "code" in ticker:
+            await update.message.reply_text(f"❌ Монета `{symbol}` не найдена.", parse_mode="Markdown")
+            return
+        price = float(ticker["lastPrice"])
+
+        existing = GRID_BOTS.get(chat_id, {}).get(symbol)
+        if existing and existing["active"]:
+            await update.message.reply_text(
+                f"⚠️ Грид по *{symbol.replace('USDT','')}* уже запущен. Сначала `/gridbot {args[0]} stop`.",
+                parse_mode="Markdown"
+            )
+            return
+
+        GRID_BOTS.setdefault(chat_id, {})[symbol] = {
+            "active": True,
+            "step_pct": step_pct,
+            "amount_usd": amount_usd,
+            "max_orders": max_orders,
+            "open_positions": [],
+            "last_trigger_price": price,
+            "realized_pnl": 0.0,
+            "total_bought": 0,
+            "total_sold": 0,
+            "started_at": datetime.utcnow().isoformat(),
+        }
+
+        await update.message.reply_text(
+            f"✅ *Грид-бот запущен* 💰 REAL\n\n"
+            f"💎 *{symbol.replace('USDT','')}* @ `{fmt_price(price)}`\n"
+            f"📐 Шаг: `{step_pct}%`  |  Сумма на уровень: `${amount_usd}`\n"
+            f"🔢 Максимум уровней: `{max_orders}`\n\n"
+            f"Бот купит `${amount_usd}` {symbol.replace('USDT','')} при падении цены на `{step_pct}%` "
+            f"от последней сделки, и продаст этот же объём при росте на `{step_pct}%` от цены покупки.\n"
+            f"Проверка каждые {GRID_JOB_INTERVAL_SEC} сек.\n\n"
+            f"⚠️ _Реальные деньги. Убедись что на балансе достаточно USDT._",
+            parse_mode="Markdown"
+        )
+        return
+
+    grid = GRID_BOTS.get(chat_id, {}).get(symbol)
+    if not grid:
+        await update.message.reply_text(
+            f"❌ Грид-бот по *{symbol.replace('USDT','')}* не запущен.", parse_mode="Markdown"
+        )
+        return
+
+    if sub == "stop":
+        grid["active"] = False
+        n_open = len(grid["open_positions"])
+        await update.message.reply_text(
+            f"⏸ Грид-бот *{symbol.replace('USDT','')}* остановлен.\n"
+            f"Открытых уровней (не проданы): `{n_open}` — позиция остаётся у тебя.\n"
+            f"Продать всё сразу: `/gridbot {args[0]} sell_all`",
+            parse_mode="Markdown"
+        )
+        return
+
+    if sub == "status":
+        ticker = get_ticker_24h(symbol)
+        price = float(ticker["lastPrice"]) if ticker and "code" not in ticker else None
+        state = "🟢 работает" if grid["active"] else "⏸ остановлен"
+        lines = [
+            f"🕸 *Грид-бот {symbol.replace('USDT','')}* — {state}\n",
+            f"📐 Шаг: `{grid['step_pct']}%`  |  Сумма на уровень: `${grid['amount_usd']}`",
+            f"🔢 Открыто уровней: `{len(grid['open_positions'])}/{grid['max_orders']}`",
+            f"📈 Сделок: куплено `{grid['total_bought']}`, продано `{grid['total_sold']}`",
+            f"💰 Реализованный PnL: `${grid['realized_pnl']:+.2f}`",
+        ]
+        if grid["open_positions"] and price:
+            unrealized = sum((price - p["buy_price"]) * p["qty"] for p in grid["open_positions"])
+            lines.append(f"📊 Нереализованный PnL (по текущей цене `{fmt_price(price)}`): `${unrealized:+.2f}`")
+            lines.append("\n*Открытые уровни:*")
+            for p in grid["open_positions"]:
+                lines.append(f"  • куплено по `{fmt_price(p['buy_price'])}` → цель `{fmt_price(p['target_sell'])}`")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    if sub == "sell_all":
+        if not grid["open_positions"]:
+            await update.message.reply_text("📭 Нет открытой позиции для продажи.")
+            return
+        qty, err = _grid_close_all_positions(chat_id, symbol, keys["api_key"], keys["api_secret"])
+        if err:
+            await update.message.reply_text(f"❌ Ошибка продажи: `{err}`", parse_mode="Markdown")
+            return
+        await update.message.reply_text(
+            f"✅ Продано `{qty}` {symbol.replace('USDT','')} по рынку.\n"
+            f"💰 Реализованный PnL грида: `${grid['realized_pnl']:+.2f}`",
+            parse_mode="Markdown"
+        )
+        return
+
+    await update.message.reply_text(
+        "❓ Неизвестная команда.\nИспользуй: `/gridbot SYMBOL start|stop|status|sell_all` или `/gridbot list`",
+        parse_mode="Markdown"
+    )
+
+
 def place_futures_market_order(symbol, side, quantity, qty_precision, api_key, api_secret, chat_id=None):
     """Открывает рыночный ордер на фьючерсах."""
     qty = round(quantity, qty_precision)
@@ -2966,8 +3301,9 @@ async def execute_trade(chat_id, trade_info, ctx):
 
     sl_base = {
         "symbol": symbol, "side": close_side, "type": "STOP_MARKET",
+        "quantity": round(qty_total, qty_precision),
         "stopPrice": round(sl, price_precision),
-        "positionSide": "BOTH", "closePosition": "true", "workingType": "MARK_PRICE",
+        "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
     }
     tp1_base = {
         "symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
@@ -2977,8 +3313,9 @@ async def execute_trade(chat_id, trade_info, ctx):
     }
     tp2_base = {
         "symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
+        "quantity": round(qty_half, qty_precision),
         "stopPrice": round(tp2, price_precision),
-        "positionSide": "BOTH", "closePosition": "true", "workingType": "MARK_PRICE",
+        "positionSide": "BOTH", "reduceOnly": "true", "workingType": "MARK_PRICE",
     }
 
     sl_res  = await loop.run_in_executor(None, _place_with_retry, sl_base,  f"SL  {symbol}")
@@ -3520,6 +3857,7 @@ def main():
     app.add_handler(CommandHandler("autotrade", autotrade_cmd))
     app.add_handler(CommandHandler("autoportfolio", autoportfolio))
     app.add_handler(CommandHandler("mode", mode_cmd))
+    app.add_handler(CommandHandler("gridbot", gridbot_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_error_handler(global_error_handler)
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
@@ -3532,6 +3870,8 @@ def main():
     app.job_queue.run_repeating(autotrade_scan_job, interval=600,  first=330)
     # Трейлинг-стоп / перевод в б/у после TP1 — каждые 2 мин, лёгкий job.
     app.job_queue.run_repeating(trailing_stop_job,  interval=120,  first=120)
+    # Спот грид-боты — проверка каждые GRID_JOB_INTERVAL_SEC (60 сек по умолчанию).
+    app.job_queue.run_repeating(spot_grid_job,      interval=GRID_JOB_INTERVAL_SEC, first=90)
 
     logger.info("Бот запущен...")
     app.run_polling()
