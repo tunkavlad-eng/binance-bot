@@ -63,6 +63,11 @@ PENDING_TRADE_TTL_SEC = 1800                  # сколько живёт неп
 GRID_BOTS: dict[int, dict[str, dict]] = {}   # chat_id -> symbol -> grid state
 GRID_MAX_ORDERS_DEFAULT = 5                  # сколько открытых уровней покупки максимум
 GRID_JOB_INTERVAL_SEC = 60                   # как часто проверяем цену для грид-ботов
+GRID_DRAWDOWN_STOP_PCT = 15.0                # circuit breaker: нереализованная просадка сетки (%), при которой бот сам себя останавливает
+GRID_TREND_FILTER_ENABLED = True             # блокировать /gridbot start в выраженном тренде монеты (4H), если не передан force
+GRID_ATR_STEP_MULT = 1.0                     # множитель ATR% для авто-шага сетки (step_pct = ATR% * mult)
+GRID_ATR_STEP_MIN_PCT = 0.3                  # нижняя граница авто-шага (%), чтобы не упереться в комиссии на мелких движениях
+GRID_ATR_STEP_MAX_PCT = 8.0                  # верхняя граница авто-шага (%), чтобы не растянуть сетку на весь диапазон
 
 # ─── Дневной лимит убытков ────────────────────────────────────────────────────
 DAILY_LOSS_LIMIT_PCT = 5.0                   # максимальный дневной убыток в % от баланса
@@ -1592,7 +1597,8 @@ HELP_SECTIONS = {
         "• `/deletekey` — удалить ключи\n"
         "• `/autotrade on/off/status` — автоторговля по сильным сигналам (нужны ключи с правом Futures Trading)\n"
         "• `/autoportfolio` — открытые авто-позиции и live PnL\n"
-        "• `/gridbot BTC start ШАГ% СУММА` — спот грид-бот (покупка на просадке / продажа на росте), нужны ключи с правом Spot Trading\n\n"
+        "• `/gridbot BTC start ШАГ% СУММА` — спот грид-бот (покупка на просадке / продажа на росте, "
+        "с проверкой баланса, фильтром тренда и circuit breaker'ом по просадке), нужны ключи с правом Spot Trading\n\n"
         "⚠️ _Для real-режима создавай ключ только с нужными правами. НИКОГДА не давай право "
         "на вывод средств (Withdrawal). Используй `/setkey` только в личке "
         "с ботом, не в группах — ключи хранятся в памяти без шифрования._"
@@ -2480,6 +2486,87 @@ def get_symbol_info(symbol, chat_id=None):
 _SPOT_SYMBOL_INFO_CACHE: dict = {}   # symbol -> {"data": (...), "time": float}
 SPOT_SYMBOL_INFO_CACHE_TTL = 1800
 
+_SYMBOL_TREND_CACHE: dict = {}   # symbol -> {"trend": str, "time": float}
+SYMBOL_TREND_CACHE_TTL = 900     # 15 минут — для риск-фильтра старта грида этого достаточно
+
+def get_symbol_trend(symbol: str) -> str | None:
+    """Тренд конкретной монеты на 4H (strong_up/up/neutral/down/strong_down).
+    В отличие от get_btc_regime — работает для любого символа, не только BTC.
+    Используется как риск-фильтр перед стартом спот-грид-бота: нет смысла
+    открывать сетку 'покупай на просадке' в монете, которая находится в
+    устойчивом сильном даунтренде — сетка будет докупать всю дорогу вниз."""
+    now = time.time()
+    cached = _SYMBOL_TREND_CACHE.get(symbol)
+    if cached and now - cached["time"] < SYMBOL_TREND_CACHE_TTL:
+        return cached["trend"]
+    try:
+        klines = get_klines(symbol, "4h", 210)
+        if not klines or len(klines) < 210:
+            return None
+        df = klines_to_df(klines)
+        close = df["close"]
+        ema20 = calc_ema(close, 20).iloc[-1]
+        ema50 = calc_ema(close, 50).iloc[-1]
+        ema200 = calc_ema(close, 200).iloc[-1]
+        p = close.iloc[-1]
+        if p > ema20 > ema50 > ema200:
+            trend = "strong_up"
+        elif p > ema50 > ema200:
+            trend = "up"
+        elif p < ema20 and p < ema50 and p < ema200:
+            trend = "strong_down"
+        elif p < ema50:
+            trend = "down"
+        else:
+            trend = "neutral"
+        _SYMBOL_TREND_CACHE[symbol] = {"trend": trend, "time": now}
+        return trend
+    except Exception as e:
+        logger.warning(f"get_symbol_trend {symbol} error: {e}")
+        return None
+
+
+def calc_grid_auto_step(symbol: str) -> float | None:
+    """Считает рекомендуемый шаг сетки (%) по реальной волатильности монеты
+    (ATR(14) на 1H), а не берёт фиксированный % одинаковый для всех.
+    Логика: шаг = (ATR / цена * 100) * GRID_ATR_STEP_MULT, зажатый в
+    [GRID_ATR_STEP_MIN_PCT, GRID_ATR_STEP_MAX_PCT].
+    Волатильная монета (например BTC в резком движении) получит более
+    широкий шаг — меньше бессмысленных микро-сделок с комиссией на шуме.
+    Спокойная монета получит более узкий шаг — иначе сетка вообще не
+    словит ни одного колебания за разумное время."""
+    try:
+        klines = get_klines(symbol, "1h", 100)
+        if not klines or len(klines) < 30:
+            return None
+        df = klines_to_df(klines)
+        atr = calc_atr(df, 14).iloc[-1]
+        price = df["close"].iloc[-1]
+        if price <= 0 or atr <= 0:
+            return None
+        atr_pct = (atr / price) * 100
+        step = atr_pct * GRID_ATR_STEP_MULT
+        step = max(GRID_ATR_STEP_MIN_PCT, min(step, GRID_ATR_STEP_MAX_PCT))
+        return round(step, 2)
+    except Exception as e:
+        logger.warning(f"calc_grid_auto_step {symbol} error: {e}")
+        return None
+
+
+def get_spot_usdt_balance(api_key, api_secret) -> float | None:
+    """Свободный USDT на споте. Проверяется перед стартом грид-бота — без
+    этого бот бодро принимал /gridbot start, а потом каждый ордер на покупку
+    падал с 'insufficient balance', и пользователь узнавал об этом только
+    из логов (или вообще не узнавал, пока не проверил /gridbot status)."""
+    data = signed_request("GET", f"{BINANCE_API}/account", api_key, api_secret)
+    if not data or "balances" not in data:
+        return None
+    for b in data["balances"]:
+        if b["asset"] == "USDT":
+            return float(b["free"])
+    return 0.0
+
+
 def get_spot_symbol_info(symbol):
     """Точность цены/количества и минимальный размер сделки (NOTIONAL) для спот-пары."""
     now = time.time()
@@ -2906,6 +2993,31 @@ def grid_bot_manage_one(chat_id, symbol, grid, api_key, api_secret):
             still_open.append(pos)
     grid["open_positions"] = still_open
 
+    # ── Circuit breaker: стоп по нереализованной просадке ──────────────────
+    # Без этого сетка продолжала бы докупать уровни на всём пути падения —
+    # step_pct ограничивает шаг между покупками, но не суммарный риск.
+    # Как только просадка по ЕЩЁ НЕ проданной части превышает
+    # GRID_DRAWDOWN_STOP_PCT, бот сам себя выключает (active=False) и шлёт
+    # алерт. Открытая позиция НЕ продаётся автоматически — решение продавать
+    # в убыток или ждать отскока оставляем пользователю (`sell_all` вручную).
+    invested = sum(p["qty"] * p["buy_price"] for p in grid["open_positions"])
+    if invested > 0:
+        unrealized = sum((price - p["buy_price"]) * p["qty"] for p in grid["open_positions"])
+        drawdown_pct = (unrealized / invested) * 100
+        if drawdown_pct <= -GRID_DRAWDOWN_STOP_PCT and grid["active"]:
+            grid["active"] = False
+            sym_short = symbol.replace("USDT", "")
+            notes.append(
+                f"🛑 *{sym_short}*: грид-бот ОСТАНОВЛЕН circuit breaker'ом\n"
+                f"Нереализованная просадка `{drawdown_pct:.1f}%` превысила лимит "
+                f"`{GRID_DRAWDOWN_STOP_PCT:.0f}%` (вложено `${invested:,.2f}`, сейчас `${invested + unrealized:,.2f}`).\n"
+                f"Новых покупок больше не будет. Открытая позиция осталась у тебя.\n"
+                f"Продать всё сразу: `/gridbot {sym_short} sell_all`\n"
+                f"Перезапустить сетку: `/gridbot {sym_short} start ...`"
+            )
+            logger.warning(f"gridbot {chat_id} {symbol}: circuit breaker сработал, drawdown={drawdown_pct:.1f}%")
+            return notes
+
     # ── Покупка: если просадка от последнего reference >= step_pct и есть место ──
     if len(grid["open_positions"]) < max_orders:
         trigger_price = grid["last_trigger_price"] * (1 - step_pct / 100)
@@ -2976,11 +3088,21 @@ async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "🕸 *Спот грид-бот*\n\n"
             "• `/gridbot BTC start 2 15` — покупать BTC на $15 при падении на 2% от "
             "последней сделки, продавать при росте на 2%\n"
+            "• `/gridbot BTC start auto 15` — шаг считается автоматически по волатильности "
+            "монеты (ATR 1H), вместо ручного %\n"
             "• `/gridbot BTC start 2 15 5` — то же самое, максимум 5 открытых уровней\n"
+            "• `/gridbot BTC start 2 15 5 force` — то же, но пропустить проверку тренда\n"
             "• `/gridbot BTC stop` — остановить (открытая позиция остаётся у тебя)\n"
-            "• `/gridbot BTC status` — куплено, реализованный PnL, нереализованная прибыль\n"
+            "• `/gridbot BTC status` — куплено, реализованный PnL, нереализованная прибыль, текущая просадка\n"
             "• `/gridbot BTC sell_all` — экстренно продать всю накопленную позицию\n"
             "• `/gridbot list` — все активные сетки\n\n"
+            "🛡 *Встроенная защита:*\n"
+            f"  └ Перед стартом проверяется, хватает ли USDT на все `макс_ордеров` уровней\n"
+            f"  └ Старт блокируется, если монета в сильном тренде (вверх или вниз, 4H) — обойти через `force`\n"
+            f"  └ Если просадка по открытой позиции превышает `{GRID_DRAWDOWN_STOP_PCT:.0f}%` — бот сам "
+            f"останавливается (circuit breaker) и шлёт алерт\n"
+            f"  └ `auto`-шаг считается от ATR(14) на 1H, зажат в диапазон "
+            f"{GRID_ATR_STEP_MIN_PCT}%–{GRID_ATR_STEP_MAX_PCT}%\n\n"
             "⚠️ Работает только в *REAL* режиме (на demo-аккаунте нет спота).\n"
             "Нужен API-ключ с правом *Enable Reading* и *Enable Spot Trading* (`/setkey`).",
             parse_mode="Markdown"
@@ -2996,7 +3118,7 @@ async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for sym, g in grids.items():
             state = "🟢 работает" if g["active"] else "⏸ остановлен"
             lines.append(
-                f"• *{sym.replace('USDT','')}*: {state} | шаг `{g['step_pct']}%` | "
+                f"• *{sym.replace('USDT','')}*: {state} | шаг `{g['step_pct']}%{' auto' if g.get('step_source')=='auto' else ''}` | "
                 f"`${g['amount_usd']}` | открыто уровней `{len(g['open_positions'])}/{g['max_orders']}` | "
                 f"PnL `${g['realized_pnl']:+.2f}`"
             )
@@ -3025,21 +3147,29 @@ async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     keys = USER_KEYS[chat_id]
 
     if sub == "start":
-        if len(args) < 4:
+        # "force" — необязательный последний токен, пропускает риск-фильтр по тренду.
+        force = any(a.lower() == "force" for a in args[2:])
+        pos_args = [a for a in args[2:] if a.lower() != "force"]
+
+        if len(pos_args) < 2:
             await update.message.reply_text(
-                "Использование: `/gridbot BTC start ШАГ% СУММА [макс_ордеров]`\n"
-                "Пример: `/gridbot BTC start 2 15`", parse_mode="Markdown"
+                "Использование: `/gridbot BTC start ШАГ%|auto СУММА [макс_ордеров] [force]`\n"
+                "Пример: `/gridbot BTC start 2 15`\n"
+                "Или с авто-шагом по волатильности: `/gridbot BTC start auto 15`\n"
+                "`force` пропускает проверку тренда (см. ниже).", parse_mode="Markdown"
             )
             return
+
+        step_is_auto = pos_args[0].lower() == "auto"
         try:
-            step_pct = float(args[2])
-            amount_usd = float(args[3])
-            max_orders = int(args[4]) if len(args) > 4 else GRID_MAX_ORDERS_DEFAULT
+            amount_usd = float(pos_args[1])
+            max_orders = int(pos_args[2]) if len(pos_args) > 2 else GRID_MAX_ORDERS_DEFAULT
+            step_pct = None if step_is_auto else float(pos_args[0])
         except ValueError:
             await update.message.reply_text("❌ Неверный формат чисел.", parse_mode="Markdown")
             return
 
-        if not (0.1 <= step_pct <= 50):
+        if step_pct is not None and not (0.1 <= step_pct <= 50):
             await update.message.reply_text("❌ Шаг должен быть от 0.1% до 50%.")
             return
         if amount_usd < 10:
@@ -3063,9 +3193,82 @@ async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # ── Авто-шаг по ATR(14) на 1H ──────────────────────────────────────────
+        # Фиксированный процент одинаковый для всех монет не имеет смысла:
+        # BTC и условный TRX двигаются с совсем разной амплитудой. "auto"
+        # считает шаг от реальной волатильности конкретной монеты и зажимает
+        # его в разумные границы (см. GRID_ATR_STEP_MIN/MAX_PCT).
+        step_source = "manual"
+        if step_is_auto:
+            auto_step = calc_grid_auto_step(symbol)
+            if auto_step is None:
+                await update.message.reply_text(
+                    "❌ Не удалось посчитать авто-шаг (нет данных по ATR). Задай шаг вручную числом.",
+                    parse_mode="Markdown"
+                )
+                return
+            step_pct = auto_step
+            step_source = "auto"
+
+        # ── Проверка баланса: хватит ли USDT на полную загрузку всех уровней ──
+        # Без этого бот радостно подтверждает старт, а через несколько уровней
+        # ордера на покупку начинают падать с "insufficient balance".
+        required_usdt = amount_usd * max_orders
+        usdt_balance = get_spot_usdt_balance(keys["api_key"], keys["api_secret"])
+        if usdt_balance is None:
+            await update.message.reply_text(
+                "❌ Не удалось проверить баланс USDT. Убедись, что ключ имеет право *Enable Reading*.",
+                parse_mode="Markdown"
+            )
+            return
+        if usdt_balance < required_usdt:
+            await update.message.reply_text(
+                f"❌ Недостаточно USDT для полной загрузки сетки.\n\n"
+                f"Нужно (если сработают все `{max_orders}` уровней): `${required_usdt:,.2f}`\n"
+                f"Доступно на споте сейчас: `${usdt_balance:,.2f}`\n\n"
+                f"Уменьши `СУММА` или `макс_ордеров`, либо пополни баланс.",
+                parse_mode="Markdown"
+            )
+            return
+
+        # ── Фильтр тренда: не открываем новую сетку в выраженном тренде ────────
+        # Грид-стратегия "покупай на просадке / продавай на росте" предполагает
+        # боковик или умеренную волатильность без явного направления:
+        #   - strong_down: сетка методично докупает актив всю дорогу вниз без
+        #     единого шанса продать в плюс — это риск потерь;
+        #   - strong_up: цена никогда не падает на шаг сетки, ни одна покупка
+        #     не срабатывает — деньги просто простаивают без дела.
+        # Оба случая — сигнал, что грид сейчас не подходящий инструмент.
+        if GRID_TREND_FILTER_ENABLED and not force:
+            trend = get_symbol_trend(symbol)
+            step_arg_for_hint = "auto" if step_is_auto else step_pct
+            if trend == "strong_down":
+                sym_short = args[0].upper()
+                await update.message.reply_text(
+                    f"⚠️ *{symbol.replace('USDT','')}* сейчас в сильном даунтренде (4H, EMA20<EMA50<EMA200).\n"
+                    f"Запуск сетки на падающем рынке рискован — велик шанс докупать всю дорогу вниз "
+                    f"без возможности продать уровни в плюс.\n\n"
+                    f"Если понимаешь риск и хочешь всё равно начать:\n"
+                    f"`/gridbot {sym_short} start {step_arg_for_hint} {amount_usd} {max_orders} force`",
+                    parse_mode="Markdown"
+                )
+                return
+            if trend == "strong_up":
+                sym_short = args[0].upper()
+                await update.message.reply_text(
+                    f"⚠️ *{symbol.replace('USDT','')}* сейчас в сильном восходящем тренде (4H, EMA20>EMA50>EMA200).\n"
+                    f"Грид-стратегия ждёт просадки, а в сильном ап-тренде цена может долго не откатываться на "
+                    f"твой шаг — деньги на балансе будут просто простаивать без сделок.\n\n"
+                    f"Если всё равно хочешь начать (например, ловишь коррекцию):\n"
+                    f"`/gridbot {sym_short} start {step_arg_for_hint} {amount_usd} {max_orders} force`",
+                    parse_mode="Markdown"
+                )
+                return
+
         GRID_BOTS.setdefault(chat_id, {})[symbol] = {
             "active": True,
             "step_pct": step_pct,
+            "step_source": step_source,
             "amount_usd": amount_usd,
             "max_orders": max_orders,
             "open_positions": [],
@@ -3076,14 +3279,17 @@ async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "started_at": datetime.utcnow().isoformat(),
         }
 
+        step_label = f"{step_pct}% (авто по ATR)" if step_source == "auto" else f"{step_pct}%"
         await update.message.reply_text(
             f"✅ *Грид-бот запущен* 💰 REAL\n\n"
             f"💎 *{symbol.replace('USDT','')}* @ `{fmt_price(price)}`\n"
-            f"📐 Шаг: `{step_pct}%`  |  Сумма на уровень: `${amount_usd}`\n"
-            f"🔢 Максимум уровней: `{max_orders}`\n\n"
+            f"📐 Шаг: `{step_label}`  |  Сумма на уровень: `${amount_usd}`\n"
+            f"🔢 Максимум уровней: `{max_orders}`  (до `${required_usdt:,.2f}` при полной загрузке)\n\n"
             f"Бот купит `${amount_usd}` {symbol.replace('USDT','')} при падении цены на `{step_pct}%` "
             f"от последней сделки, и продаст этот же объём при росте на `{step_pct}%` от цены покупки.\n"
             f"Проверка каждые {GRID_JOB_INTERVAL_SEC} сек.\n\n"
+            f"🛡 *Circuit breaker:* если нереализованная просадка сетки превысит `{GRID_DRAWDOWN_STOP_PCT:.0f}%`, "
+            f"бот сам остановится и пришлёт алерт (позиция при этом не продаётся автоматически).\n\n"
             f"⚠️ _Реальные деньги. Убедись что на балансе достаточно USDT._",
             parse_mode="Markdown"
         )
@@ -3113,14 +3319,18 @@ async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         state = "🟢 работает" if grid["active"] else "⏸ остановлен"
         lines = [
             f"🕸 *Грид-бот {symbol.replace('USDT','')}* — {state}\n",
-            f"📐 Шаг: `{grid['step_pct']}%`  |  Сумма на уровень: `${grid['amount_usd']}`",
+            f"📐 Шаг: `{grid['step_pct']}%{' (авто по ATR)' if grid.get('step_source')=='auto' else ''}`  |  Сумма на уровень: `${grid['amount_usd']}`",
             f"🔢 Открыто уровней: `{len(grid['open_positions'])}/{grid['max_orders']}`",
             f"📈 Сделок: куплено `{grid['total_bought']}`, продано `{grid['total_sold']}`",
             f"💰 Реализованный PnL: `${grid['realized_pnl']:+.2f}`",
         ]
         if grid["open_positions"] and price:
             unrealized = sum((price - p["buy_price"]) * p["qty"] for p in grid["open_positions"])
+            invested = sum(p["qty"] * p["buy_price"] for p in grid["open_positions"])
             lines.append(f"📊 Нереализованный PnL (по текущей цене `{fmt_price(price)}`): `${unrealized:+.2f}`")
+            if invested > 0:
+                dd_pct = (unrealized / invested) * 100
+                lines.append(f"🛡 Просадка: `{dd_pct:+.1f}%`  (стоп circuit breaker'а: `-{GRID_DRAWDOWN_STOP_PCT:.0f}%`)")
             lines.append("\n*Открытые уровни:*")
             for p in grid["open_positions"]:
                 lines.append(f"  • куплено по `{fmt_price(p['buy_price'])}` → цель `{fmt_price(p['target_sell'])}`")
