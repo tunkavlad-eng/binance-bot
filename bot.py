@@ -3058,6 +3058,7 @@ async def spot_grid_job(ctx: ContextTypes.DEFAULT_TYPE):
         for symbol, grid in list(grids.items()):
             if not grid.get("active"):
                 continue
+            grid["last_check"] = time.time()
             try:
                 notes = await loop.run_in_executor(
                     None, grid_bot_manage_one, chat_id, symbol, grid,
@@ -3115,12 +3116,33 @@ async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("📭 Нет активных грид-ботов.")
             return
         lines = ["🕸 *Активные грид-боты:*\n"]
+
+        # Явное предупреждение вместо тихого пропуска: spot_grid_job вообще
+        # не трогает сетки пользователя, если режим не REAL или нет ключей —
+        # раньше это выглядело как "сетка работает 🟢, но 0 сделок" без единой
+        # подсказки почему.
+        mode = USER_MODE.get(chat_id, "real")
+        has_keys = chat_id in USER_KEYS
+        any_active = any(g["active"] for g in grids.values())
+        if any_active and (mode != "real" or not has_keys):
+            reason = "режим не REAL (`/mode`)" if mode != "real" else "нет API ключей (`/setkey`)"
+            lines.append(
+                f"⚠️ *Внимание:* сейчас {reason} — ни одна из сеток НЕ проверяется, "
+                f"даже помеченные 🟢. Это и есть причина, если давно нет сделок.\n"
+            )
+
         for sym, g in grids.items():
             state = "🟢 работает" if g["active"] else "⏸ остановлен"
+            last_check = g.get("last_check")
+            if last_check:
+                mins_ago = int((time.time() - last_check) / 60)
+                check_note = f" | посл. проверка `{mins_ago} мин назад`"
+            else:
+                check_note = " | ещё не проверялась ни разу"
             lines.append(
                 f"• *{sym.replace('USDT','')}*: {state} | шаг `{g['step_pct']}%{' auto' if g.get('step_source')=='auto' else ''}` | "
                 f"`${g['amount_usd']}` | открыто уровней `{len(g['open_positions'])}/{g['max_orders']}` | "
-                f"PnL `${g['realized_pnl']:+.2f}`"
+                f"PnL `${g['realized_pnl']:+.2f}`{check_note}"
             )
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
@@ -3277,6 +3299,7 @@ async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "total_bought": 0,
             "total_sold": 0,
             "started_at": datetime.utcnow().isoformat(),
+            "last_check": None,
         }
 
         step_label = f"{step_pct}% (авто по ATR)" if step_source == "auto" else f"{step_pct}%"
@@ -3317,13 +3340,24 @@ async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ticker = get_ticker_24h(symbol)
         price = float(ticker["lastPrice"]) if ticker and "code" not in ticker else None
         state = "🟢 работает" if grid["active"] else "⏸ остановлен"
+        last_check = grid.get("last_check")
+        if last_check:
+            mins_ago = int((time.time() - last_check) / 60)
+            check_line = f"🕓 Последняя проверка: `{mins_ago} мин назад` (раз в {GRID_JOB_INTERVAL_SEC} сек)"
+        else:
+            check_line = "🕓 Последняя проверка: ещё не проверялась ни разу"
         lines = [
             f"🕸 *Грид-бот {symbol.replace('USDT','')}* — {state}\n",
             f"📐 Шаг: `{grid['step_pct']}%{' (авто по ATR)' if grid.get('step_source')=='auto' else ''}`  |  Сумма на уровень: `${grid['amount_usd']}`",
             f"🔢 Открыто уровней: `{len(grid['open_positions'])}/{grid['max_orders']}`",
             f"📈 Сделок: куплено `{grid['total_bought']}`, продано `{grid['total_sold']}`",
             f"💰 Реализованный PnL: `${grid['realized_pnl']:+.2f}`",
+            check_line,
         ]
+        mode = USER_MODE.get(chat_id, "real")
+        if grid["active"] and (mode != "real" or chat_id not in USER_KEYS):
+            reason = "режим не REAL (`/mode`)" if mode != "real" else "нет API ключей (`/setkey`)"
+            lines.append(f"\n⚠️ *Сетка сейчас НЕ проверяется:* {reason}.")
         if grid["open_positions"] and price:
             unrealized = sum((price - p["buy_price"]) * p["qty"] for p in grid["open_positions"])
             invested = sum(p["qty"] * p["buy_price"] for p in grid["open_positions"])
