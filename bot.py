@@ -1,4 +1,5 @@
 import os
+import json
 import hmac
 import hashlib
 import time
@@ -61,6 +62,43 @@ PENDING_TRADE_TTL_SEC = 1800                  # сколько живёт неп
 # Работает ТОЛЬКО в REAL режиме — демо-аккаунт в этом боте только для фьючерсов,
 # спотового баланса там нет.
 GRID_BOTS: dict[int, dict[str, dict]] = {}   # chat_id -> symbol -> grid state
+
+def save_grid_state():
+    """Сохраняет GRID_BOTS на диск (атомарная запись через временный файл +
+    rename, чтобы не оставить битый JSON, если процесс упадёт посреди записи).
+    Без этого любой рестарт бота (деплой, падение, перезагрузка сервера)
+    стирал все активные сетки, хотя реальные позиции на бирже оставались —
+    пользователь терял видимость и контроль над своими же деньгами."""
+    try:
+        # JSON требует строковые ключи — chat_id (int) конвертируем туда-обратно.
+        serializable = {str(chat_id): grids for chat_id, grids in GRID_BOTS.items()}
+        tmp_path = GRID_STATE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, GRID_STATE_FILE)
+    except Exception as e:
+        logger.error(f"save_grid_state error: {e}")
+
+
+def load_grid_state():
+    """Восстанавливает GRID_BOTS из файла при старте бота. API-ключи (USER_KEYS)
+    сознательно НЕ сохраняются на диск (они и так хранятся в памяти без
+    шифрования — дублировать в файл было бы дополнительным риском), поэтому
+    после рестарта грид-боты появятся в статусе 🟢, но сделок не будет, пока
+    пользователь заново не введёт `/setkey`. Это ожидаемо и безопаснее, чем
+    хранить секреты на диске в открытом виде."""
+    global GRID_BOTS
+    if not os.path.exists(GRID_STATE_FILE):
+        return
+    try:
+        with open(GRID_STATE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        GRID_BOTS = {int(chat_id): grids for chat_id, grids in raw.items()}
+        n_grids = sum(len(g) for g in GRID_BOTS.values())
+        logger.info(f"load_grid_state: восстановлено {n_grids} грид-ботов для {len(GRID_BOTS)} пользователей")
+    except Exception as e:
+        logger.error(f"load_grid_state error: {e}")
+
 GRID_MAX_ORDERS_DEFAULT = 5                  # сколько открытых уровней покупки максимум
 GRID_JOB_INTERVAL_SEC = 60                   # как часто проверяем цену для грид-ботов
 GRID_DRAWDOWN_STOP_PCT = 15.0                # circuit breaker: нереализованная просадка сетки (%), при которой бот сам себя останавливает
@@ -68,6 +106,7 @@ GRID_TREND_FILTER_ENABLED = True             # блокировать /gridbot s
 GRID_ATR_STEP_MULT = 1.0                     # множитель ATR% для авто-шага сетки (step_pct = ATR% * mult)
 GRID_ATR_STEP_MIN_PCT = 0.3                  # нижняя граница авто-шага (%), чтобы не упереться в комиссии на мелких движениях
 GRID_ATR_STEP_MAX_PCT = 8.0                  # верхняя граница авто-шага (%), чтобы не растянуть сетку на весь диапазон
+GRID_STATE_FILE = os.environ.get("GRID_STATE_FILE", "grid_bots_state.json")  # куда сохраняем активные сетки между рестартами
 
 # ─── Дневной лимит убытков ────────────────────────────────────────────────────
 DAILY_LOSS_LIMIT_PCT = 5.0                   # максимальный дневной убыток в % от баланса
@@ -3049,6 +3088,7 @@ async def spot_grid_job(ctx: ContextTypes.DEFAULT_TYPE):
     if not GRID_BOTS:
         return
     loop = asyncio.get_running_loop()
+    changed = False
     for chat_id, grids in list(GRID_BOTS.items()):
         keys = USER_KEYS.get(chat_id)
         if not keys:
@@ -3059,6 +3099,7 @@ async def spot_grid_job(ctx: ContextTypes.DEFAULT_TYPE):
             if not grid.get("active"):
                 continue
             grid["last_check"] = time.time()
+            changed = True
             try:
                 notes = await loop.run_in_executor(
                     None, grid_bot_manage_one, chat_id, symbol, grid,
@@ -3071,6 +3112,12 @@ async def spot_grid_job(ctx: ContextTypes.DEFAULT_TYPE):
                         logger.warning(f"spot_grid_job send {chat_id}: {e}")
             except Exception as e:
                 logger.warning(f"spot_grid_job {chat_id} {symbol}: {e}")
+
+    # Сохраняем на диск раз в проход job'а (каждые GRID_JOB_INTERVAL_SEC) —
+    # так рестарт бота в худшем случае теряет данные максимум за один цикл,
+    # а не всё состояние сеток целиком.
+    if changed:
+        save_grid_state()
 
 
 async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3095,6 +3142,7 @@ async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "• `/gridbot BTC start 2 15 5 force` — то же, но пропустить проверку тренда\n"
             "• `/gridbot BTC stop` — остановить (открытая позиция остаётся у тебя)\n"
             "• `/gridbot BTC status` — куплено, реализованный PnL, нереализованная прибыль, текущая просадка\n"
+            "• `/gridbot BTC check` — форсировать проверку прямо сейчас (не ждать 60 сек) — проверить, что бот реально жив\n"
             "• `/gridbot BTC sell_all` — экстренно продать всю накопленную позицию\n"
             "• `/gridbot list` — все активные сетки\n\n"
             "🛡 *Встроенная защита:*\n"
@@ -3301,6 +3349,7 @@ async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "started_at": datetime.utcnow().isoformat(),
             "last_check": None,
         }
+        save_grid_state()  # сохраняем сразу, не дожидаясь следующего цикла job'а
 
         step_label = f"{step_pct}% (авто по ATR)" if step_source == "auto" else f"{step_pct}%"
         await update.message.reply_text(
@@ -3325,8 +3374,62 @@ async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if sub == "check":
+        # Форсирует проверку прямо сейчас, не дожидаясь следующего тика
+        # фонового job'а (до GRID_JOB_INTERVAL_SEC). Прямое доказательство,
+        # что бот жив: реально дёргает биржу, обновляет last_check и, если
+        # условие выполнено, тут же совершает сделку — а не просто отвечает
+        # заглушкой "всё ок".
+        if not grid["active"]:
+            await update.message.reply_text(
+                f"⏸ Сетка *{symbol.replace('USDT','')}* остановлена — проверка не выполняется. "
+                f"Запусти заново: `/gridbot {args[0]} start ...`",
+                parse_mode="Markdown"
+            )
+            return
+
+        msg = await update.message.reply_text(f"🔄 Проверяю *{symbol.replace('USDT','')}* прямо сейчас...", parse_mode="Markdown")
+        loop = asyncio.get_running_loop()
+        try:
+            notes = await loop.run_in_executor(
+                None, grid_bot_manage_one, chat_id, symbol, grid, keys["api_key"], keys["api_secret"],
+            )
+        except Exception as e:
+            await msg.edit_text(f"❌ Ошибка при проверке: `{e}`", parse_mode="Markdown")
+            return
+
+        grid["last_check"] = time.time()
+        save_grid_state()
+
+        ticker = get_ticker_24h(symbol)
+        price = float(ticker["lastPrice"]) if ticker and "code" not in ticker else None
+
+        if notes:
+            # Сделка произошла прямо во время ручной проверки — самое
+            # прямое доказательство, что бот действительно работает.
+            await msg.edit_text("✅ Проверка выполнена — есть новая сделка!", parse_mode="Markdown")
+            for note in notes:
+                await update.message.reply_text(note, parse_mode="Markdown")
+            return
+
+        ref = grid.get("last_trigger_price")
+        lines = [f"✅ *Проверка {symbol.replace('USDT','')} выполнена прямо сейчас*", ""]
+        if ref and price:
+            if len(grid["open_positions"]) < grid["max_orders"]:
+                next_buy = ref * (1 - grid["step_pct"] / 100)
+                dist_pct = ((price - next_buy) / price) * 100
+                lines.append(f"Текущая цена: `{fmt_price(price)}`")
+                lines.append(f"Точка отсчёта: `{fmt_price(ref)}`")
+                lines.append(f"Купит при цене ≤ `{fmt_price(next_buy)}` (до срабатывания `{dist_pct:.2f}%`)")
+            else:
+                lines.append("Все уровни заняты — ждём, пока сработает продажа хотя бы одного.")
+        lines.append("\nСделок не было — условие ещё не выполнено (это нормально, не ошибка).")
+        await msg.edit_text("\n".join(lines), parse_mode="Markdown")
+        return
+
     if sub == "stop":
         grid["active"] = False
+        save_grid_state()
         n_open = len(grid["open_positions"])
         await update.message.reply_text(
             f"⏸ Грид-бот *{symbol.replace('USDT','')}* остановлен.\n"
@@ -3358,6 +3461,25 @@ async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if grid["active"] and (mode != "real" or chat_id not in USER_KEYS):
             reason = "режим не REAL (`/mode`)" if mode != "real" else "нет API ключей (`/setkey`)"
             lines.append(f"\n⚠️ *Сетка сейчас НЕ проверяется:* {reason}.")
+
+        # Явный "прицел" — от чего именно бот считает точку отсчёта и на какой
+        # цене купит следующий уровень. Без этого со стороны непонятно, что
+        # бот вообще что-то отслеживает: last_trigger_price = цена последней
+        # сделки (или старта, если сделок ещё не было), и это ОБНОВЛЯЕТСЯ
+        # динамически после каждой покупки/продажи — не статичное число.
+        ref = grid.get("last_trigger_price")
+        if ref and price:
+            if len(grid["open_positions"]) < grid["max_orders"]:
+                next_buy = ref * (1 - grid["step_pct"] / 100)
+                dist_pct = ((price - next_buy) / price) * 100
+                lines.append(
+                    f"\n🎯 Точка отсчёта (посл. сделка/старт): `{fmt_price(ref)}`\n"
+                    f"🛒 Следующая покупка при цене ≤ `{fmt_price(next_buy)}` "
+                    f"(сейчас `{fmt_price(price)}`, до срабатывания `{dist_pct:.2f}%`)"
+                )
+            else:
+                lines.append(f"\n🎯 Точка отсчёта: `{fmt_price(ref)}` (все уровни заняты — новых покупок не будет, пока не продастся хотя бы один)")
+
         if grid["open_positions"] and price:
             unrealized = sum((price - p["buy_price"]) * p["qty"] for p in grid["open_positions"])
             invested = sum(p["qty"] * p["buy_price"] for p in grid["open_positions"])
@@ -3379,6 +3501,7 @@ async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if err:
             await update.message.reply_text(f"❌ Ошибка продажи: `{err}`", parse_mode="Markdown")
             return
+        save_grid_state()
         await update.message.reply_text(
             f"✅ Продано `{qty}` {symbol.replace('USDT','')} по рынку.\n"
             f"💰 Реализованный PnL грида: `${grid['realized_pnl']:+.2f}`",
@@ -3387,7 +3510,7 @@ async def gridbot_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "❓ Неизвестная команда.\nИспользуй: `/gridbot SYMBOL start|stop|status|sell_all` или `/gridbot list`",
+        "❓ Неизвестная команда.\nИспользуй: `/gridbot SYMBOL start|stop|status|check|sell_all` или `/gridbot list`",
         parse_mode="Markdown"
     )
 
@@ -4077,6 +4200,8 @@ def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("Установи TELEGRAM_BOT_TOKEN")
+
+    load_grid_state()  # восстанавливаем активные грид-боты после рестарта (см. GRID_STATE_FILE)
 
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", start))
